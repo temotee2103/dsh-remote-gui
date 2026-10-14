@@ -36,4 +36,4 @@ jobs:
           "
 
       - name: Tests
-        run: node --test test/
+        run: node --test
