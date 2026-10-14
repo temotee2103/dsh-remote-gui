@@ -5,6 +5,39 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-10-14
+
+Packaging and documentation only -- no behaviour change beyond one retry.
+
+### Added
+
+- Test suite (`node --test`, no dependencies) covering the RPC envelope, the
+  credential exchange and its 401 refresh, the loopback fence, the session field
+  mapping and the client half's slot registration — 15 tests against a local mock
+  remote, plus a CI workflow that runs them on push and pull request.
+- English README, this changelog, and `docs/` for the remote contract and the
+  client handoff notes.
+- `.github/workflows/ci.yml`.
+
+### Fixed
+
+- The npm tarball listed a `SPEC.md` that had moved to `docs/`, so the contract
+  document referenced from both READMEs would have been missing from the next
+  release.
+- A remote launch-token read that comes back empty right after a tunnel is
+  established is retried once instead of leaving the embedded GUI on the remote's
+  401 page.
+- The test invocation used the directory form of `node --test`, which Node 22
+  rejects; the suite now uses auto-discovery.
+
+### Changed
+
+- The host half is split into `registry` / `tunnel` / `remote` / `routes` /
+  `tool` modules behind an unchanged public export set; `lib/index.js` is now
+  just the composition root.
+- Remote session polling slows to once a minute while the local instance is
+  selected, instead of a remote RPC per host every 8 seconds.
+
 ## [0.1.0] - 2026-10-14
 
 First release.
