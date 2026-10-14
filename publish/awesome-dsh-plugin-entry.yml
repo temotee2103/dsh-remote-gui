@@ -1,0 +1,20 @@
+# 提交给 awesome-dsh-plugin 的条目（dsh-market 读这份目录）
+#
+# 目标位置：awesome-dsh-plugin/awesome-dsh-plugin 仓库里的
+#   data/plugins/temotee2103__dsh-remote-gui.yml
+# 一个 PR 只加这一个文件。
+#
+# 硬性要求（来自该仓库 contributing.md，逐条核对过）：
+#   - 仓库 package.json 必须声明 dsh.bundle        ✓（我们有 dsh.bundle.patch）
+#   - 仓库创建满 1 天（CI 自动查）                  ⚠️ 建仓当天不能提，要等满 24h
+#   - 仓库添加 dsh-plugin topic                     ← 建仓后要加
+#   - 描述必须与代码一致（维护者会读代码核对）        ✓ 下面三条功能都已实现并实测
+#   - category 要贴合实际做的事，可选值里有 remote    ✓
+#   - description.en 必填、以句号结尾、不含 ": "（会被 YAML 当嵌套键）
+
+url: https://github.com/temotee2103/dsh-remote-gui
+name: temotee2103/dsh-remote-gui
+category: remote
+description:
+  en: Embeds a remote DeepSeek Harness GUI in the local DSH window over an SSH tunnel, lists the remote sessions, and switches between the local instance and any remote host.
+  zh: 通过 SSH 隧道把远端 DSH 的 GUI 嵌进本地 DSH 界面，列出远端会话，并在本地实例与任意远端主机之间切换。

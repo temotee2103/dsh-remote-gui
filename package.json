@@ -1,0 +1,72 @@
+{
+  "name": "dsh-remote-gui",
+  "version": "0.1.0",
+  "description": "Embed a remote DeepSeek Harness GUI in the local DSH window over an SSH tunnel, list the remote sessions, and switch between the local instance and any remote host. Standalone implementation using the DSH 0.2.x credential-cookie and typert RPC contract.",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.js",
+    "client.js",
+    "cordis.patch.yml",
+    "screenshots.json",
+    "README.md",
+    "SPEC.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "ssh",
+    "tunnel",
+    "remote",
+    "remote-gui",
+    "port-forward"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/temotee2103/dsh-remote-gui.git"
+  },
+  "homepage": "https://github.com/temotee2103/dsh-remote-gui#readme",
+  "bugs": {
+    "url": "https://github.com/temotee2103/dsh-remote-gui/issues"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.0-rc.1 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.1.0-rc.1 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.1 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  }
+}

@@ -1,0 +1,9 @@
+# dsh-remote-gui bundle patch：把插件行插入 profile 组合。
+#
+# ⚠️ 行名必须是**裸包名**（不是子路径）：宿主扫描客户端模块时会把行的 specifier
+# 解析到包根并读那里的 `dsh.client`。用子路径命名的行会被跳过 —— 结果是宿主半边
+# 能用、而客户端半边（侧栏入口/面板）永远不出现。这一点是 dsh-builtin-browser 的
+# 补丁里明文写过的坑。
+- insert:
+    - id: dsh-remote-gui
+      name: 'dsh-remote-gui'
