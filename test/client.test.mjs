@@ -287,3 +287,94 @@ test('describeRouteFailure：401/404 必须说清"要重启应用"，其它状�
   assert.equal(c, '读取远端会话正文失败（HTTP 502）')
   assert.equal(f(undefined, '兜底'), '兜底')
 })
+
+// ── 主会话 / 子会话折叠（判据来自远端 session/list 的权威字段）──────────────
+// 形状全部取自 2026-10-14 真远端 session/list 的实测条目（346 条）。
+
+/** 根会话（VPS DSH / Medisync 这种）：没有 parentSessionId / origin。 */
+const ROOT = { sessionId: 'session-4d6e059e-3e17-4d6e-059e-3e1700000000', title: 'VPS DSH', blank: false, turns: 19, origin: null, parentSessionId: null }
+/** 子代理会话：origin='subagent' 且带 parentSessionId（实测两者总是同时出现）。 */
+const SUBAGENT = { sessionId: 'a5bd3dc4-7320-4745-b012-5498cca32342', title: '## Evaluator人格:评估者', blank: false, turns: 1, origin: 'subagent', parentSessionId: 'a6d7d443dc50' }
+/** 探针空壳：宿主自己生成的 id 形状**不是**这样 —— 它是调用方自带 id 建的，字段上看不出父子关系。 */
+const SHELL = { sessionId: 'probe-route-mv7wtsx0', title: null, blank: true, turns: 0, origin: null, parentSessionId: null }
+/** 用户刚新建、还没说话的空会话：同样是空壳形状，但 id 是宿主生成的 ⇒ 必须保持可见。 */
+const EMPTY_ROOT = { sessionId: 'session-0f07cc46-1fe6-4da5-b143-2b405f110fe1', title: null, blank: true, turns: 0, origin: null, parentSessionId: null }
+
+test('classifySession：parentSessionId / origin=subagent 是权威判据，缺省即主会话', () => {
+  const { exports } = loadClientModule()
+  const c = exports.__classifySessionForTest
+  assert.equal(c(ROOT), 'root')
+  assert.equal(c(SUBAGENT), 'subagent')
+  // 只有其中一个字段也要认（fork 出来的会话只有 parentSessionId，没有 origin）
+  assert.equal(c({ sessionId: 'x', parentSessionId: 'p' }), 'subagent')
+  assert.equal(c({ sessionId: 'x', origin: 'subagent' }), 'subagent')
+  // null / undefined / 空串都算"没有父"（宿主半边把缺省统一成 null）
+  assert.equal(c({ sessionId: 'x', parentSessionId: null, origin: null }), 'root')
+  assert.equal(c(undefined), 'root')
+})
+
+test('classifySession：空壳探针按**启发式**折叠，但绝不误杀"宿主生成的空会话"', () => {
+  const { exports } = loadClientModule()
+  const c = exports.__classifySessionForTest
+  assert.equal(c(SHELL), 'shell', 'probe-route-* 这类自带 id 的空壳要折叠')
+  assert.equal(c(EMPTY_ROOT), 'root', '用户新建的空会话（id 是 session-<uuid>）必须留着')
+  // 一旦有标题或跑过一轮，即使 id 是自带的也不再是空壳
+  assert.equal(c({ ...SHELL, title: '正经标题' }), 'root')
+  assert.equal(c({ ...SHELL, turns: 1 }), 'root')
+  assert.equal(c({ ...SHELL, blank: false }), 'root')
+  assert.equal(c({ ...SHELL, blank: undefined }), 'root')
+})
+
+test('selectVisibleSessions：默认只显示主会话，计数分开，正打开的那条永不折叠', () => {
+  const { exports } = loadClientModule()
+  const f = exports.__selectVisibleSessionsForTest
+  const all = [ROOT, SUBAGENT, SHELL, EMPTY_ROOT]
+
+  const filtered = f(all, false, null)
+  assert.deepEqual(filtered.shown.map((s) => s.sessionId), [ROOT.sessionId, EMPTY_ROOT.sessionId])
+  assert.equal(filtered.hidden, 2)
+  assert.equal(filtered.hiddenSubagent, 1, '子代理按权威字段计数')
+  assert.equal(filtered.hiddenShell, 1, '空壳探针单独计数（界面上要区别说明）')
+
+  // 正在打开的子会话即使被判成子会话也要留在列表里（否则正文还开着、左栏却没了那一行）
+  const kept = f(all, false, SUBAGENT.sessionId)
+  assert.ok(kept.shown.some((s) => s.sessionId === SUBAGENT.sessionId))
+  assert.equal(kept.hidden, 1, '被 keepId 保住的就不算"已隐藏"')
+  assert.equal(kept.hiddenSubagent, 0)
+  assert.equal(kept.subagentTotal, 1, '但分类总数不变（开关的渲染条件用它）')
+
+  // 显示全部 = 原样返回，但**分类计数必须照旧**：2026-10-14 真界面上踩到的缺陷 ——
+  // 第一版在 showAll 时把隐藏数归零，开关于是自己消失，切到全部后再也切不回"只看主会话"。
+  const everything = f(all, true, null)
+  assert.deepEqual(everything.shown.map((s) => s.sessionId), all.map((s) => s.sessionId))
+  assert.equal(everything.subagentTotal, 1)
+  assert.equal(everything.shellTotal, 1)
+  assert.equal(everything.hidden, 0, '"当前没显示"的数才是 0')
+
+  assert.equal(f([], false, null).hidden, 0)
+  assert.equal(f([], true, null).shown.length, 0)
+})
+
+test('默认值与持久化：默认只显示主会话，选择记在 dsh-remote-gui.subagents', () => {
+  const { exports } = loadClientModule()
+  assert.equal(typeof exports.__RemoteSessionsPanelForTest, 'function')
+  // 源码级契约（与 dsh-remote-gui.archived 同一约定）：
+  assert.match(clientSource, /dsh-remote-gui\.subagents/)
+  assert.match(clientSource, /localStorage\.getItem\(SUBAGENT_VIEW_KEY\) === "all"/, '默认必须是"只显示主会话"')
+  assert.match(clientSource, /localStorage\.setItem\(SUBAGENT_VIEW_KEY/)
+  // 界面上必须写明判据，不能只靠猜
+  assert.match(clientSource, /data-dsh-remote-subagent-toggle/)
+  assert.match(clientSource, /origin=subagent/)
+})
+
+test('hostSendsLineage：能认出"宿主半边还是旧代码"（没有 parentSessionId 键）', () => {
+  // 客户端半边是热加载的、宿主半边要重启应用才换 —— 这个判据决定要不要提示用户重启。
+  const { exports } = loadClientModule()
+  const f = exports.__hostSendsLineageForTest
+  assert.equal(f([ROOT]), true, '新宿主：根会话也会显式带 parentSessionId: null 这个键')
+  assert.equal(f([ROOT, SUBAGENT]), true)
+  assert.equal(f([{ sessionId: 's1', title: 'T1', blank: false, turns: 3 }]), false, '旧宿主：键整个不存在')
+  assert.equal(f([]), true, '没有会话时不做判断（不该凭空报警）')
+  assert.equal(f(undefined), true)
+})
+

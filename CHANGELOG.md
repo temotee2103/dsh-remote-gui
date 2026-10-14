@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **The remote session list can now show only main sessions** (default). The panel used to
+  flatten every session, and a real remote had 317 of 346 rows belonging to subagents/subtasks
+  (`## Evaluator人格:评估者…`, `你是研究助理…`, `probe-*`) — the real conversations were buried.
+  `lib/routes.js` now carries the two authoritative fields it used to drop
+  (`SessionSummary.parentSessionId`, `SessionSummary.origin: 'subagent'` —
+  `@deepseek-ai/dsh-api-session-controller/lib/types/list.js`), and `client.js` folds them with
+  two clearly separated rules: the authoritative fields, plus a labelled heuristic for caller-named
+  empty shells (`session/create` lets a caller pass its own `sessionId`, and such a session is
+  header-identical to a fresh user session — the probe sessions of that shape are the only ones
+  affected). The choice is remembered in
+  `localStorage['dsh-remote-gui.subagents']` (`roots` / `all`) and the list header carries a
+  one-click toggle plus a line stating which part is heuristic. Filtering is display-only:
+  archiving, reading, sending and creating are untouched, and the session currently open is never
+  removed from the list. Verified on a live remote: 346 → 24 rows (322 folded: 317 by the
+  authoritative fields + 5 by the heuristic), with `VPS DSH` / `开店模型` / `NPY Hotpot` /
+  `Medisync` / `Ayam Lava` all still listed.
+
 ## [0.1.3] - 2026-10-14
 
 ### Fixed

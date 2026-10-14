@@ -33,7 +33,7 @@ const SESSION_ITEM = {
 }
 
 /** 起一个模拟真远端行为的 HTTP 服务（随机端口，只绑 127.0.0.1）。 */
-function startMockRemote({ rotateCookieOnFirstRpc = false } = {}) {
+function startMockRemote({ rotateCookieOnFirstRpc = false, items = [SESSION_ITEM] } = {}) {
   const state = {
     token: TOKEN,
     cookie: 'abc',
@@ -106,7 +106,7 @@ function startMockRemote({ rotateCookieOnFirstRpc = false } = {}) {
         // 按方法回不同形状 —— 每个形状都是 2026-10-14 从真远端读到的（见 docs/SPEC.md）。
         const method = parsed?.method
         const args = parsed?.payload?.args ?? {}
-        let value = { items: [SESSION_ITEM] }
+        let value = { items }
         if (method === 'session/page') {
           value = { records: [{ type: 'event', event: { type: 'user/message', seq: 7, time: 1, data: { content: [{ type: 'text', text: 'hi' }] } } }], hasMore: true }
         } else if (method === 'session/projections') {
@@ -156,8 +156,8 @@ function startMockRemote({ rotateCookieOnFirstRpc = false } = {}) {
 }
 
 /** 造一套"假隧道 + 假 token 来源"的依赖，于是完全不需要 ssh。 */
-async function makeHarness({ rotateCookieOnFirstRpc = false, hostId = 'mock-host' } = {}) {
-  const mock = await startMockRemote({ rotateCookieOnFirstRpc })
+async function makeHarness({ rotateCookieOnFirstRpc = false, hostId = 'mock-host', items } = {}) {
+  const mock = await startMockRemote({ rotateCookieOnFirstRpc, ...(items === undefined ? {} : { items }) })
   const host = {
     id: hostId,
     alias: 'mock-alias',
@@ -263,10 +263,43 @@ test('GET /sessions：字段映射正确（title/turns 取自 projections.values
     assert.equal(s.cwd, '/tmp')
     assert.equal(s.running, false)
     assert.equal(s.updatedAt, 1)
+    // 主会话：远端没给这两个字段 ⇒ 必须显式映射成 null（不能让客户端看到 undefined 与 null 两种"没有"）
+    assert.equal(s.parentSessionId, null)
+    assert.equal(s.origin, null)
   } finally {
     await h.close()
   }
 })
+
+test('GET /sessions：把「主会话 vs 子代理会话」的权威判据原样透传（parentSessionId / origin）', async () => {
+  // 2026-10-14 的缺陷就是这里：宿主半边只挑了 title/cwd/running/blank/updatedAt/turns，
+  // 判据字段被吞掉 ⇒ 客户端只能靠标题猜（界面上几百条子会话把主会话埋掉）。
+  // 形状取自真远端 session/list 的实测条目。
+  const subagentItem = {
+    sessionId: 'a5bd3dc4-7320-4745-b012-5498cca32342',
+    updatedAt: 2,
+    running: false,
+    blank: false,
+    cwd: '/home/temo/deepseek-harness',
+    parentSessionId: 'a6d7d443dc50',
+    origin: 'subagent',
+    projections: { values: { title: '## Evaluator人格:评估者', sessionStats: { turns: 1 } } },
+  }
+  const h = await makeHarness({ hostId: 'host-subagent', items: [subagentItem] })
+  try {
+    const out = await call(h.routes, '/api/dsh-remote-gui/sessions', {
+      url: `/api/dsh-remote-gui/sessions?id=${h.host.id}`,
+    })
+    assert.equal(out.status, 200)
+    const s = JSON.parse(out.payload).sessions[0]
+    assert.equal(s.parentSessionId, 'a6d7d443dc50', 'parentSessionId 必须透传（丢掉它就丢了唯一权威判据）')
+    assert.equal(s.origin, 'subagent')
+    assert.equal(s.title, '## Evaluator人格:评估者')
+  } finally {
+    await h.close()
+  }
+})
+
 
 test('RPC 信封：method 必须是斜杠形式，且 payload.args._request 必须存在', async () => {
   const h = await makeHarness({ hostId: 'host-envelope' })

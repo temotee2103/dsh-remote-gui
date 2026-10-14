@@ -47,7 +47,7 @@ list the remote sessions, and switch between the local instance and any remote h
 |---|---|
 | **SSH 隧道管理** | `ssh -L <本地端口>:127.0.0.1:<远端端口> <别名>`；看门狗每 15s 检查并按需重连；本机重启后自动"收养"还在监听的隧道，不重复起 |
 | **远端凭据自动兑换** | 远端 `dsh web` 每个 `/api` 都要求按 authority 绑定的浏览器 cookie。插件用 ssh 读远端的启动 token，经隧道换一次 cookie 并按主机缓存，收到 401/403 自动刷新重试 |
-| **远端会话列表** | 走 `/api/session/list`（typert 信封），显示标题 / 最后活动 / cwd / 运行中 |
+| **远端会话列表** | 走 `/api/session/list`（typert 信封），显示标题 / 最后活动 / cwd / 运行中。**默认只显示主会话**（按远端的权威字段 `parentSessionId` / `origin=subagent` 折叠子代理会话，另有少量按"自带 id 的空壳会话"启发式折叠），列表头给出一行「已隐藏 N 条子会话 · 显示全部」可一键切换 |
 | **面板内嵌远端 GUI** | iframe 直连隧道地址。首次加载用**带 token 的 seedUrl**：那一次 303 会把凭据 cookie 种进浏览器，之后长期可用 |
 | **本地 ↔ 远端切换** | 顶部一个选择器：`本地实例` 或任意已注册远端。本地模式走同源 `/api/session/list`，iframe 指向 `location.origin` |
 | **会话归档** | 在面板里把远端会话归档掉（走 `workspace/archiveSession`） |

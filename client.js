@@ -381,6 +381,120 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     try { window.localStorage.setItem(ARCHIVED_KEY, JSON.stringify(map)); } catch (e) { /* 忽略 */ }
   }
 
+  /**
+   * 本机记住"远端会话列表要不要显示子会话"（默认**只显示主会话**）。
+   *
+   * 背景（2026-10-14 真机实测，346 条会话）：远端 `session/list` 的条目里有**权威判据**，
+   * 只是宿主半边以前把它丢掉了（现在已补上）：
+   *   · `parentSessionId` —— 这条会话是由哪条会话派生的（子代理/子任务）
+   *   · `origin === 'subagent'` —— 宿主自己标的子代理来源
+   * 实测两者同时出现（317 / 346 条），缺省即根会话。桌面端的侧栏本来就把子会话收在父会话下面，
+   * 而这个面板是平铺列表 ⇒ 几百条子会话直接把真正的主会话埋掉。
+   *
+   * 只有**显示**受影响：归档、读正文、发送、新建都不碰。
+   */
+  var SUBAGENT_VIEW_KEY = "dsh-remote-gui.subagents";
+
+  /** true = 显示全部（含子会话）；默认 false = 只显示主会话。 */
+  function readShowAllSessions() {
+    try { return window.localStorage.getItem(SUBAGENT_VIEW_KEY) === "all"; } catch (e) { return false; }
+  }
+
+  function writeShowAllSessions(all) {
+    try { window.localStorage.setItem(SUBAGENT_VIEW_KEY, all ? "all" : "roots"); } catch (e) { /* 忽略 */ }
+  }
+
+  /**
+   * 宿主自己生成的会话 id 形状（`brandString('session-' + randomUUID())`，
+   * 见 dsh-api-session-controller/lib/index.js 的 create / fork 两条路径）。
+   * 只用于**第 3 类**的启发式判断，见 classifySession。
+   */
+  var HOST_SESSION_ID = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+  /**
+   * 给一条会话分类（**纯函数**，可单测）：
+   *   'subagent' —— 有 parentSessionId 或 origin==='subagent' 的派生会话（**权威字段**）
+   *   'shell'    —— 空壳会话：**id 不是宿主生成的形状** ＋ 没标题 ＋ 没轮次 ＋ blank。
+   *                 这是**启发式**：`session/create` 允许调用方自带 sessionId，而宿主不会给
+   *                 这种会话记 parentSession/origin（只有"子代理 spawn"和"fork"才记），
+   *                 所以探针脚本自建的会话在字段上与"用户新建的会话"完全同形。
+   *                 实测这一类就是 probe-route-* / probe-archive-* / session-probe-* 那批
+   *                 （cwd=/tmp，界面上因为没标题而显示成 cwd 末段 "tmp"）。
+   *                 代价：真有人用自带 id 建一条正经会话、且它当时还是空的，会被折叠 ——
+   *                 但他一旦发出第一条消息（turns>0 / blank=false）就立刻重新出现。
+   *   'root'     —— 主会话（保持可见）。
+   */
+  function classifySession(s) {
+    if (!s) return "root";
+    if (s.origin === "subagent") return "subagent";
+    if (s.parentSessionId !== undefined && s.parentSessionId !== null && s.parentSessionId !== "") return "subagent";
+    var canonical = HOST_SESSION_ID.test(String(s.sessionId === undefined ? "" : s.sessionId));
+    if (!canonical && !s.title && !s.turns && s.blank === true) return "shell";
+    return "root";
+  }
+
+  /**
+   * 按上面的分类折叠列表（**纯函数**）。
+   *
+   * ⚠️ 计数必须**与 showAll 无关**地算出来：2026-10-14 在真界面上踩过一次 ——
+   * 第一版在"显示全部"时把隐藏数归零，于是开关自己消失了（`hidden > 0` 才渲染），
+   * 切到全部之后**再也切不回"只看主会话"**（localStorage 还会一直卡在 all）。
+   * 所以这里分开返回：`subagentTotal/shellTotal` = 整张列表里各有多少条（分类总数），
+   * `hiddenSubagent/hiddenShell` = 其中**当前没显示**的（排除 keepId 保住的那条）。
+   *
+   * @param sessions 远端会话数组
+   * @param showAll  true = 原样返回全部
+   * @param keepId  当前正打开的那条 —— 即使被判成子会话也**绝不**从视图里抽掉（否则用户正在看的东西会突然消失）
+   * @returns { shown, hidden, hiddenSubagent, hiddenShell, subagentTotal, shellTotal }
+   */
+  function selectVisibleSessions(sessions, showAll, keepId) {
+    var all = sessions || [];
+    var shown = [];
+    var hiddenSubagent = 0;
+    var hiddenShell = 0;
+    var subagentTotal = 0;
+    var shellTotal = 0;
+    for (var i = 0; i < all.length; i++) {
+      var s = all[i];
+      var kind = classifySession(s);
+      var kept = !!(keepId && s && s.sessionId === keepId);
+      if (kind === "subagent") { subagentTotal++; if (!showAll && !kept) hiddenSubagent++; }
+      else if (kind === "shell") { shellTotal++; if (!showAll && !kept) hiddenShell++; }
+      if (showAll || kind === "root" || kept) shown.push(s);
+    }
+    return {
+      shown: shown,
+      hidden: hiddenSubagent + hiddenShell,
+      hiddenSubagent: hiddenSubagent,
+      hiddenShell: hiddenShell,
+      subagentTotal: subagentTotal,
+      shellTotal: shellTotal,
+    };
+  }
+
+  /** 折叠判据的人话说明（界面上必须如实写明哪一部分是启发式）。 */
+  function subagentFilterBasis() {
+    return "子会话判据 = 远端 session/list 的 origin=subagent / parentSessionId（权威字段）；"
+      + "另有少数按启发式折叠：id 不是宿主生成的 session-<uuid> 且无标题、无轮次的空壳会话（探针类）。";
+  }
+
+  /**
+   * 宿主半边的 `/sessions` 响应里**有没有**谱系字段（`parentSessionId`，现在是显式映射成 null）。
+   *
+   * 为什么要判它：客户端半边是**热加载**的（刷新页面就用新的 client.js），而宿主半边要重启
+   * DSH 应用才换。旧宿主把判据字段吞掉了 ⇒ 权威那一段失效、只折叠启发式那几条
+   * （实测：346 条里只折叠 5 条，看着像"没生效"）。所以这里如实提示"要重启应用"，
+   * 而不是让用户以为功能坏了。
+   */
+  function hostSendsLineage(sessions) {
+    var all = sessions || [];
+    if (all.length === 0) return true;
+    for (var i = 0; i < all.length; i++) {
+      if (all[i] && ("parentSessionId" in all[i])) return true;
+    }
+    return false;
+  }
+
   // ── 主面板（中心列；同 key 才被切到）────────────────────────────────────────
 
   /**
@@ -455,6 +569,15 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     var showArchivedState = useState(false);
     var showArchived = showArchivedState[0];
     var setShowArchived = showArchivedState[1];
+
+    /**
+     * 「只显示主会话」开关（默认开）：远端列表混着几百条子代理/子任务会话，
+     * 平铺出来会把主会话埋掉。选择记在 localStorage['dsh-remote-gui.subagents']（all / roots）。
+     * 见 classifySession / selectVisibleSessions 的说明。
+     */
+    var showAllSessionsState = useState(readShowAllSessions);
+    var showAllSessions = showAllSessionsState[0];
+    var setShowAllSessions = showAllSessionsState[1];
 
     var mountedRef = useRef(true);
     useEffect(function () {
@@ -1016,9 +1139,16 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
 
     var items = buildItems(open ? open.records : []);
 
-    /** 过滤后的会话列表（先按本机归档表隐藏，再按过滤词匹配；大小写不敏感）。 */
+    /**
+     * 过滤后的会话列表，顺序固定为：
+     *   ① 折叠子会话（只显示主会话；正在打开的那条永不折叠）
+     *   ② 按本机归档表隐藏
+     *   ③ 按过滤词匹配（大小写不敏感）
+     * 三步都只影响**显示**，不动远端任何东西。
+     */
+    var subView = selectVisibleSessions(sessions, showAllSessions, open ? open.sessionId : null);
     var archivedHere = (activeHostKey && archivedMap[activeHostKey]) || [];
-    var shownSessions = sessions || [];
+    var shownSessions = subView.shown;
     if (archivedHere.length && !showArchived) {
       shownSessions = shownSessions.filter(function (s) { return archivedHere.indexOf(s.sessionId) < 0; });
     }
@@ -1027,6 +1157,13 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
       shownSessions = shownSessions.filter(function (s) {
         return (sessionTitle(s) + " " + (s.cwd || "") + " " + s.sessionId).toLowerCase().indexOf(needle) >= 0;
       });
+    }
+
+    /** 切换「只看主会话 / 显示全部」（并记住选择）。 */
+    function toggleSubagentView() {
+      var next = !showAllSessions;
+      setShowAllSessions(next);
+      writeShowAllSessions(next);
     }
 
     function renderTranscript() {
@@ -1243,12 +1380,59 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
               style: Object.assign({}, styles.input, { flex: "1 1 auto", width: "100%", fontSize: 12, padding: "5px 8px" })
             })
           ),
+          // 宿主半边还没重启（响应里没有 parentSessionId 字段）时如实说明，
+          // 否则用户会以为"折叠没生效"（实际只折叠了启发式那几条）。
+          !hostSendsLineage(sessions) && sessions.length > 0 ? h("div", {
+            style: Object.assign({}, styles.sub, { padding: "0 10px 8px", lineHeight: 1.5 })
+          },
+            "⚠️ 宿主半边还是旧代码：这份会话列表里没有 parentSessionId / origin 字段，"
+            + "子会话折叠只剩启发式那一档。重启 DSH 应用后权威判据才会生效。"
+          ) : null,
+          // 「只看主会话 / 显示全部」开关 + 折叠判据说明。
+          // ⚠️ 刻意**不放在 listHead 那一行**：左列固定 260px，标题行里已经有
+          // "远端会话 · N 条 / 显示已归档 / ＋新建"，再塞一个带计数的按钮会把
+          // "远端会话 · N 条"压成竖排字（2026-10-14 在真界面上实测到这个挤压）。
+          // 开关的渲染条件用**分类总数**而不是"当前隐藏数"：否则切到"显示全部"后
+          // 隐藏数变 0、开关自己消失 ⇒ 再也切不回只看主会话。
+          (subView.subagentTotal + subView.shellTotal) > 0 ? h("div", {
+            style: Object.assign({}, styles.sub, {
+              padding: "0 10px 8px", display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, lineHeight: 1.5
+            })
+          },
+            h("button", {
+              type: "button",
+              "data-dsh-remote-subagent-toggle": "",
+              "aria-pressed": showAllSessions ? "true" : "false",
+              "aria-label": showAllSessions
+                ? ("只看主会话（折叠 " + (subView.subagentTotal + subView.shellTotal) + " 条子会话）")
+                : ("显示全部会话（含 " + subView.hidden + " 条子会话）"),
+              title: subagentFilterBasis(),
+              style: Object.assign({}, styles.btn, { fontSize: 11 }),
+              onClick: toggleSubagentView
+            }, showAllSessions
+              ? ("显示全部中（含 " + (subView.subagentTotal + subView.shellTotal) + " 条子会话）· 只看主会话")
+              : ("已隐藏 " + subView.hidden + " 条子会话 · 显示全部")),
+            // 折叠判据必须写在脸上：权威字段是哪两个、哪一部分只是启发式（见 classifySession）。
+            // 两段计数分开说 —— 旧宿主下权威段会是 0（字段都没了），不能写成"已折叠 0 条子会话"。
+            !showAllSessions ? h("span", null,
+              (subView.hiddenSubagent > 0
+                ? "已折叠 " + subView.hiddenSubagent + " 条子会话（origin=subagent / parentSessionId，权威字段）"
+                : "没有按权威字段折叠任何会话")
+              + (subView.hiddenShell > 0
+                ? "，另有 " + subView.hiddenShell + " 条按启发式折叠（id 非宿主生成的 session-<uuid> 且无标题无轮次的空壳会话）"
+                : "")
+              + "。"
+            ) : null
+          ) : null,
           h("div", { style: styles.listBox },
             !activeHost ? h("div", { style: styles.empty }, "先添加并连接一台远端主机") : null,
             activeHost && !tunnelRunning ? h("div", { style: styles.empty }, "隧道未连接 —— 点上面的「连接隧道」") : null,
             tunnelRunning && sessions.length === 0 ? h("div", { style: styles.empty }, "没有读到远端会话（或远端还没有会话）") : null,
             tunnelRunning && sessions.length > 0 && shownSessions.length === 0
-              ? h("div", { style: styles.empty }, "没有匹配「" + filter.trim() + "」的会话") : null,
+              ? h("div", { style: styles.empty },
+                  filter.trim()
+                    ? ("没有匹配「" + filter.trim() + "」的会话")
+                    : ("全部 " + sessions.length + " 条都被折叠了（点上方的「显示全部」）")) : null,
             shownSessions.map(function (s) {
               var on = !!open && open.sessionId === s.sessionId;
               var title = sessionTitle(s);
@@ -1466,5 +1650,8 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
   module.exports.__mergeBySeqForTest = mergeBySeq;
   module.exports.__textBlocksForTest = textBlocks;
   module.exports.__describeRouteFailureForTest = describeRouteFailure;
+  module.exports.__classifySessionForTest = classifySession;
+  module.exports.__selectVisibleSessionsForTest = selectVisibleSessions;
+  module.exports.__hostSendsLineageForTest = hostSendsLineage;
   return module.exports;
 }});

@@ -93,7 +93,8 @@ RPC：     POST http://127.0.0.1:<隧道端口>/api/<ns>/<method>
 Host    = { id, alias, name, port, localPort, autoTunnel, tunnel?:Tunnel, seedUrl?:string }
 Tunnel  = { localPort, remotePort, alias, state:'starting'|'running'|'stopped', exitCode:number|null }
 Session = { sessionId, title:string|null, running:boolean, blank:boolean,
-            updatedAt:number, cwd:string|null, turns:number|null }
+            updatedAt:number, cwd:string|null, turns:number|null,
+            parentSessionId:string|null, origin:'subagent'|null }
 ```
 
 要点：
@@ -158,12 +159,28 @@ UI：**中心列的原生面板**（与 `@linxin666/dsh-task-board`、`@linxin66
    界面上如实写着"轮询刷新 · 每 3 秒"，**不假装是实时流**；真流式要开远端
    `/api/remote.mux` WebSocket（本节上面的契约里有实测记录），是后续工作。
 8. **归档的显示是"本机视图过滤"，不是远端权威状态**：
-   远端 `session/list` 的条目里**没有归档字段**（keys 只有
-   `sessionId/updatedAt/agentAvailable/running/blank/cwd/projections`；归档过的与没归档的形状一模一样），
-   真正的归档状态在 `workspace/*` 那条**流式**通道里。所以归档 RPC 成功之后，
-   那一行还会被远端列表重新列出来 —— 看起来像"点了没反应"。
+   远端 `session/list` 的条目里**没有归档字段**，真正的归档状态在 `workspace/*` 那条**流式**通道里。
+   所以归档 RPC 成功之后，那一行还会被远端列表重新列出来 —— 看起来像"点了没反应"。
    本插件把"我归档过哪些"记在浏览器 `localStorage['dsh-remote-gui.archived']`，
    默认隐藏这些行，并提供「显示已归档 N」勾选框可以调回来。界面上写明是**本机记录**。
+8b. **主会话 / 子会话折叠（2026-10-14 加）**：`session/list` 的条目里**有权威判据**
+   —— `parentSessionId`（由哪条会话派生）与 `origin:'subagent'`（宿主标的子代理来源），
+   见 `@deepseek-ai/dsh-api-session-controller/lib/types/list.js` 的 `listFields()`。
+   ⚠️ 宿主半边曾经只挑 title/cwd/running/blank/updatedAt/turns，把这两个字段**丢掉**了
+   （旧版 SPEC 在这里写"keys 只有 sessionId/updatedAt/agentAvailable/running/blank/cwd/projections"，
+   **那个结论是错的**，已按真机实测更正）。丢掉判据的后果：面板是平铺列表，
+   346 条里 317 条是子代理会话，真正的主会话被埋掉。
+   现在默认「只显示主会话」（选择记在 `localStorage['dsh-remote-gui.subagents']`，`all`/`roots`），
+   列表头给出一行「已隐藏 N 条子会话 · 显示全部」可一键切回。
+   规则是**两段**、且界面如实分开说明（纯函数 `classifySession` / `selectVisibleSessions`，有单测）：
+   - 权威段：`parentSessionId` 非空 或 `origin === 'subagent'`（实测 346 条里 317 条，两字段同时出现）；
+   - 启发式段：id **不是**宿主生成的 `session-<uuid>` 形状 **且** 无标题、无轮次、`blank` 的空壳会话
+     （`session/create` 允许调用方自带 id，而那种会话在字段上与主会话同形；实测这一类就是
+     `probe-route-*` / `probe-archive-*` / `session-probe-*` 那批探针）。
+     代价写在这里：真有人用自带 id 建一条正经会话、且它当时还是空的，会被折叠；
+     但发出第一条消息（turns>0 / blank=false）后立刻重新出现。
+   过滤只影响**显示**：归档、读正文、发送、新建都不碰；**正被打开的那条会话永不折叠**。
+
 9. 所有请求走同源 `/api/dsh-remote-gui/...`（本机 GUI 的 origin），不需要额外凭据。
 10. 样式用内联 style + CSS 变量，不引入外部 CSS。**前景色一律 `inherit`、层次用 `opacity`**，
     只有强调色写死 —— 避免"背景取主题变量 + 前景写死白"在浅色主题下变成隐形文字（曾经踩过）。
