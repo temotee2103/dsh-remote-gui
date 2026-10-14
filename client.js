@@ -65,6 +65,12 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
   var HOSTS_POLL_MS = 12000;
   var SESSIONS_POLL_MS = 8000;
   var HEALTH_POLL_MS = 5000;
+  /**
+   * 选中「本地实例」时，远端会话轮询**降频**而不是停掉。
+   * 停掉会让主机卡上的「N 个远端会话 · M 运行中」变成陈旧值；不降频则会在你根本没看远端的时候
+   * 持续产生远端 RPC 流量（每个主机一次 / 8 秒）。一分钟一次是两者的折中。
+   */
+  var SESSIONS_POLL_IDLE_MS = 60000;
 
   // ── 小工具 ─────────────────────────────────────────────────────────────────
 
@@ -361,9 +367,12 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
 
     useEffect(function () {
       void refreshSessions();
-      var timer = window.setInterval(function () { void refreshSessions(); }, SESSIONS_POLL_MS);
+      // 本地实例被选中时降频（见 SESSIONS_POLL_IDLE_MS 的说明）：主机卡仍能显示会话数，
+      // 但不会在你看着本地的时候每 8 秒打一轮远端 RPC。
+      var interval = isLocalTarget ? SESSIONS_POLL_IDLE_MS : SESSIONS_POLL_MS;
+      var timer = window.setInterval(function () { void refreshSessions(); }, interval);
       return function () { window.clearInterval(timer); };
-    }, [refreshSessions]);
+    }, [refreshSessions, isLocalTarget]);
 
     // 本地实例的会话：**只在选中「本地实例」且主机列表已读完时**轮询；
     // 切走时把定时器清掉并置 cancelled，保证不会有留在后台跑的本地轮询。
