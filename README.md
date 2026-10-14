@@ -134,24 +134,32 @@ dsh plugin --profile desktop add github:temotee2103/dsh-remote-gui
 RPC        POST http://127.0.0.1:<隧道端口>/api/<ns>/<method>
            cookie: dsh-auth-…                      ← 必须，否则 401 "unauthorized"
            body: {"type":"client-request","rpcId":"…","method":"<ns>/<method>",
-                  "payload":{"args":{"_request":{…params…}}}}
+                  "payload":{"args":{"<参数名>":{…params…}}}}
            数据在 result.value；method 必须与 endpoint 完全一致（斜杠形式）
 
 会话列表   /api/session/list，_request = {}   →   result.value.items[]
+归档会话   /api/workspace/archiveSession，request = {sessionId}  →  result.value.archivedSessionIds[]
 
 远端启动 token
            ssh <alias> journalctl --user -u dsh-web -n 400 --no-pager \
              | grep -oE 'token=[A-Za-z0-9_-]+' | tail -1 | cut -d= -f2
 ```
 
-三条容易踩的：
+四条容易踩的：
 
 1. `method` 用**斜杠**形式（`session/list`），与 URL 末段一致；写成 `session.list` 会被拒：
    `method "session.list" does not match endpoint "session/list"`。
-2. `payload` 必须是 `{"args":{"_request":{…}}}` —— 少一层就是
-   `Remote payload must contain exactly one plain-object args field`；`_request` 缺失是
-   `args fields do not match the descriptor: missing "_request"`。
-3. **iframe 是浏览器自己发请求**，所以"把凭据 cookie 种进浏览器"这一步不能省 ——
+2. `payload` 必须是 `{"args":{…}}` —— 少一层就是
+   `Remote payload must contain exactly one plain-object args field`。
+3. ⚠️ **args 里那个 key 是"宿主方法的形参名"，不是固定字符串。** 曾经把这条写成"必须有
+   `_request`"，结果归档会话静默失败。判定依据是安装目录里的 typert 描述符：
+   `resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-api-<ns>-controller/lib/typert.host.js`
+   的 `invocations[].parameters[].{name,wire}`。实测（2026-10-14，26 个 typert.host.js / 140 条
+   invocation 全量核对）：`session/list` 是 `_request`（**唯一**带下划线的方法），
+   `workspace/archiveSession` 与其余 `session/*` / `workspace/*` / `schedule/*` / `job/*` 等全是 `request`。
+   用错的表现是 `result.ok=false` + `error.code='gateway/arguments-invalid'` +
+   `missing "request"; unexpected "_request"`。插件里的登记表：`lib/remote.js` 的 `ARGS_KEY_BY_METHOD`。
+4. **iframe 是浏览器自己发请求**，所以"把凭据 cookie 种进浏览器"这一步不能省 ——
    这就是 seedUrl 存在的理由（服务端拿不到浏览器那次请求的 cookie）。
 
 ---

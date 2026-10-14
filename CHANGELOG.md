@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Archiving a remote session never worked.** `remoteRpc()` hard-coded the RPC envelope as
+  `payload.args._request`, but `_request` is the parameter name of `session/list` only —
+  `workspace/archiveSession` declares `request`. The remote answered
+  `result.ok=false`, `error.code='gateway/arguments-invalid'`,
+  `missing "request"; unexpected "_request"`, the route turned that into 502, and the panel
+  just looked unresponsive. The key is now chosen per method: `lib/remote.js` carries
+  `ARGS_KEY_BY_METHOD` (+ an `argsKey` option) and the archive call site passes
+  `argsKey: 'request'` explicitly. Verified against a real remote over the tunnel:
+  wrong key → `gateway/arguments-invalid`; right key → `ok=true` with `archivedSessionIds`;
+  `POST /api/dsh-remote-gui/session-archive` → HTTP 200 instead of 502.
+  The docs had taught the wrong rule (`args` must contain `_request`) — SPEC.md, both READMEs
+  and docs/client-notes.md now state the real contract and where to read it.
+- **The panel could not be dismissed** (users had to restart the app). The overlay was a
+  full-screen modal whose only exit was a small borderless `✕ 关闭` button that inherited its
+  colour from a theme variable it could not rely on. It is now a non-modal right-hand drawer:
+  an explicit, ≥32px-tall, outlined close button with a visible label, `Esc`, click-on-scrim,
+  and the footer icon toggles it. Closing removes the drawer and the scrim, drops the keydown
+  listener, and restores the body's inline `overflow` to exactly what it was.
+- **The「添加」button rendered as a blank white block.** `primaryBtn` hard-coded
+  `color: "#fff"` while its background came from the theme variable
+  `--dsw-alias-brand-primary`, and the disabled state had no styling of its own — in a theme
+  where that variable resolves pale (and with the browser's default disabled grey), white text
+  landed on a white fill. The disabled state now has an explicit pair (translucent chip fill +
+  secondary label colour) and a border; the input's text colour no longer relies on `inherit`.
+- **Nested-instance startup.** The default target was `local`, so the panel embedded the local
+  instance inside itself via `location.origin`, showing a frozen "Loading plugins…" page.
+  The default is now the first registered remote host (a previous choice still wins, and only
+  a hostless install falls back to local), and local mode no longer embeds anything — it shows
+  a note instead. The local session list is unchanged.
+
 ## [0.1.2] - 2026-10-14
 
 ### Fixed

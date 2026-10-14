@@ -20,12 +20,29 @@ RPC：     POST http://127.0.0.1:<隧道端口>/api/<ns>/<method>
           content-type: application/json
           cookie: dsh-auth-…（必须，否则 401 "unauthorized"）
           body: {"type":"client-request","rpcId":"…","method":"<ns>/<method>",
-                 "payload":{"args":{"_request":{…params…}}}}
+                 "payload":{"args":{"<参数名>":{…params…}}}}
           响应：{"type":"server-response","rpcId":"…","result":{"ok":true,"value":…}}
           失败：result.ok=false，result.error={code,message,details}
 
 会话列表：/api/session/list   _request = {}      → result.value.items[]
-列出错误：method 必须与 endpoint 一致（斜杠形式）；args 里必须有 _request
+列出错误：method 必须与 endpoint 一致（斜杠形式）；args 的 key 见下条
+
+⚠️ args 的 key 是**宿主方法的形参名**，不是固定字符串（这里以前写成"必须有 _request"，
+   是错的，并误导了实现：归档会话因此静默失败过）。判定依据在安装目录的 typert 描述符里：
+     resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-api-<ns>-controller/lib/typert.host.js
+     → invocations[].parameters[].{ name, wire }   ← 这两个字段就是 key
+   已知（2026-10-14 全量核对 26 个 typert.host.js / 140 条 invocation）：
+     · session/list              → `_request`（**唯一**用下划线前缀的方法）
+     · workspace/archiveSession  → `request`
+     · 其余 session/*（create/projections/page/follow/prompt/rename/cancel/search/selectModel/updateQueue…）、
+       workspace/*（create/delete/rename/pinSession/unpinSession/unarchiveSession…）、
+       schedule/*、job/*、messageFeedback/*、skills/list … → 全是 `request`
+   用错 key 的症状：result.ok=false，
+     error.code='gateway/arguments-invalid'，
+     error.message='… args fields do not match the descriptor: missing "request"; unexpected "_request"'
+   写新调用前先读对应 controller 的 typert.host.js；实现里的登记表在 lib/remote.js 的
+   ARGS_KEY_BY_METHOD（remoteRpc 的 argsKey 选项可覆盖）。
+
 远端启动 token：ssh <alias> journalctl --user -u dsh-web -n 400 --no-pager | grep -oE 'token=…' | tail -1
 ```
 

@@ -103,10 +103,42 @@ function startMockRemote({ rotateCookieOnFirstRpc = false } = {}) {
         }
 
         res.writeHead(200, { 'content-type': 'application/json' })
+        // 按方法回不同形状 —— 每个形状都是 2026-10-14 从真远端读到的（见 docs/SPEC.md）。
+        const method = parsed?.method
+        const args = parsed?.payload?.args ?? {}
+        let value = { items: [SESSION_ITEM] }
+        if (method === 'session/page') {
+          value = { records: [{ type: 'event', event: { type: 'user/message', seq: 7, time: 1, data: { content: [{ type: 'text', text: 'hi' }] } } }], hasMore: true }
+        } else if (method === 'session/projections') {
+          value = { asOfSeq: 42, values: { title: 'T1' } }
+        } else if (method === 'session/create') {
+          value = { sessionId: 's-new', agentPreset: 'standard' }
+        } else if (method === 'session/prompt') {
+          // 远端对空 content 的真实拒绝（零费用路径）；有文本才算受理
+          const content = args?.request?.content
+          if (!Array.isArray(content) || content.length === 0) {
+            res.end(JSON.stringify({
+              type: 'server-response',
+              rpcId: 'mock-1',
+              result: {
+                ok: false,
+                error: {
+                  code: 'gateway/bad-request',
+                  message: 'prompt content must include non-whitespace text or an attachment',
+                  details: {},
+                },
+              },
+            }))
+            return
+          }
+          value = { accepted: true }
+        } else if (method === 'workspace/archiveSession') {
+          value = { archivedSessionIds: ['s1'] }
+        }
         res.end(JSON.stringify({
           type: 'server-response',
           rpcId: 'mock-1',
-          result: { ok: true, value: { items: [SESSION_ITEM] } },
+          result: { ok: true, value },
         }))
       })
       return
@@ -170,8 +202,8 @@ async function makeHarness({ rotateCookieOnFirstRpc = false, hostId = 'mock-host
   }
 }
 
-/** 直接调用路由处理器（不出网）：可指定 remoteAddress / Host 来测围栏。 */
-function call(routes, routePath, { method = 'GET', url, remoteAddress = '127.0.0.1', host = '127.0.0.1:19387' } = {}) {
+/** 直接调用路由处理器（不出网）：可指定 remoteAddress / Host 来测围栏，也可带请求体。 */
+function call(routes, routePath, { method = 'GET', url, remoteAddress = '127.0.0.1', host = '127.0.0.1:19387', payload: requestBody } = {}) {
   const route = routes.find((r) => r.path === routePath)
   if (!route) throw new Error(`no route ${routePath}`)
   let status = 0
@@ -186,6 +218,14 @@ function call(routes, routePath, { method = 'GET', url, remoteAddress = '127.0.0
     headers: { host, 'content-type': 'application/json' },
     socket: { remoteAddress },
     connection: { remoteAddress },
+    // 最小的事件目标：readJsonBody 用 on('data'/'end'/'error') 读请求体。
+    // 同步把整块 body 发出去 —— 监听器是在路由处理器里同步注册的，所以不会丢事件。
+    on(event, fn) {
+      if (event === 'data' && requestBody !== undefined) fn(String(requestBody))
+      if (event === 'end') fn()
+      return this
+    },
+    destroy() {},
   }
   // 注意：围栏拒绝是**同步**返回的（没有 promise），所以这里要 Promise.resolve 包一层
   return Promise.resolve(route.handler(req, res)).then(() => ({ status, payload }))
@@ -241,13 +281,38 @@ test('RPC 信封：method 必须是斜杠形式，且 payload.args._request 必�
     assert.ok(rpc.args, 'payload.args 必须存在')
     assert.ok(rpc.args._request, 'payload.args._request 必须存在')
     assert.deepEqual(rpc.args._request, {})
+    // session/list 是**唯一**形参名带下划线前缀的方法，别的 key 都是错的
+    assert.deepEqual(Object.keys(rpc.args), ['_request'])
+  } finally {
+    await h.close()
+  }
+})
+
+test('RPC 信封：归档用的 key 是 `request`（不是 session/list 的 `_request`）', async () => {
+  // 这里是 2026-10-14 那个静默失败缺陷的回归测试：
+  // workspace/archiveSession 的宿主形参名是 `request`（typert 描述符实测），
+  // 写成 `_request` 会让远端回 gateway/arguments-invalid，归档永远不生效。
+  const h = await makeHarness({ hostId: 'host-archive-key' })
+  try {
+    const out = await call(h.routes, '/api/dsh-remote-gui/session-archive', {
+      method: 'POST',
+      url: '/api/dsh-remote-gui/session-archive',
+      payload: JSON.stringify({ id: h.host.id, sessionId: 's1' }),
+      headers: { 'content-type': 'application/json' },
+    })
+    assert.equal(h.mock.state.rpcs.length, 1)
+    const rpc = h.mock.state.rpcs[0]
+    assert.equal(rpc.path, '/api/workspace/archiveSession')
+    assert.equal(rpc.method, 'workspace/archiveSession')
+    assert.deepEqual(Object.keys(rpc.args), ['request'], 'args 的 key 必须正好是 request')
+    assert.deepEqual(rpc.args.request, { sessionId: 's1' })
+    assert.equal(out.status, 200, '插件路由应当回 200，而不是把 arguments-invalid 变成 502')
   } finally {
     await h.close()
   }
 })
 
 test('凭据：RPC 请求必须带兑换来的 cookie', async () => {
-  const h = await makeHarness({ hostId: 'host-cookie' })
   try {
     const out = await call(h.routes, '/api/dsh-remote-gui/sessions', {
       url: `/api/dsh-remote-gui/sessions?id=${h.host.id}`,

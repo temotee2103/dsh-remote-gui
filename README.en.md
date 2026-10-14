@@ -141,27 +141,40 @@ Credential exchange
 RPC        POST http://127.0.0.1:<tunnel port>/api/<ns>/<method>
            cookie: dsh-auth-...            <- required, otherwise 401 "unauthorized"
            body: {"type":"client-request","rpcId":"...","method":"<ns>/<method>",
-                  "payload":{"args":{"_request":{...params...}}}}
+                  "payload":{"args":{"<parameter name>":{...params...}}}}
            Data lives in result.value; method must match the endpoint exactly
            (slash form)
 
 Session list
            /api/session/list with _request = {}   ->   result.value.items[]
+Archive
+           /api/workspace/archiveSession with request = {sessionId}
+             -> result.value.archivedSessionIds[]
 
 Remote launch token
            ssh <alias> journalctl --user -u dsh-web -n 400 --no-pager \
              | grep -oE 'token=[A-Za-z0-9_-]+' | tail -1 | cut -d= -f2
 ```
 
-Three things that are easy to get wrong:
+Four things that are easy to get wrong:
 
 1. `method` uses the **slash** form (`session/list`) and must match the URL's last segment.
    The dotted form is rejected:
    `method "session.list" does not match endpoint "session/list"`.
-2. `payload` must be `{"args":{"_request":{...}}}`. One level less gives
-   `Remote payload must contain exactly one plain-object args field`; a missing `_request`
-   gives `args fields do not match the descriptor: missing "_request"`.
-3. **The iframe issues its own browser request**, so planting the credential cookie in the
+2. `payload` must be `{"args":{...}}`. One level less gives
+   `Remote payload must contain exactly one plain-object args field`.
+3. ⚠️ **The key inside `args` is the host method's *parameter name*, not a fixed string.**
+   This document used to claim it is always `_request`, which is wrong and made archive fail
+   silently. Read the authoritative descriptor in the install tree:
+   `resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-api-<ns>-controller/lib/typert.host.js`
+   -> `invocations[].parameters[].{name,wire}`. Measured on 2026-10-14 across 26
+   `typert.host.js` files / 140 invocations: `session/list` uses `_request` (the **only**
+   underscore-prefixed one) while `workspace/archiveSession` and every other
+   `session/*` / `workspace/*` / `schedule/*` / `job/*` method uses `request`.
+   A wrong key yields `result.ok=false`, `error.code='gateway/arguments-invalid'`,
+   `missing "request"; unexpected "_request"`. The plugin's registry lives in
+   `lib/remote.js` (`ARGS_KEY_BY_METHOD`).
+4. **The iframe issues its own browser request**, so planting the credential cookie in the
    browser cannot be skipped — that is exactly why `seedUrl` exists. A server-side exchange
    does not help the browser's own request.
 

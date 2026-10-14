@@ -1,41 +1,50 @@
 /**
  * dsh-remote-gui —— 客户端半边（浏览器里跑）。
  *
- * 作用：在本地 DSH 界面里用 SSH 隧道把「远端 DSH 的 GUI」嵌进来，
- * 并把远端会话列在面板里。宿主半边（lib/index.js）负责隧道、凭据、RPC。
+ * 作用：在**本地这个正常界面里**用远端 DSH 的会话 —— 列远端会话、点开读它的
+ * 对话正文、在里面输入并发送、新建远端会话。**没有任何 iframe / 嵌套网页。**
+ * 宿主半边（lib/index.js / lib/routes.js）负责隧道、凭据、远端 RPC。
+ *
+ * ── 形态 ────────────────────────────────────────────────────────────────────
+ * 中心列的原生面板，走宿主自己的两个插槽（与 @linxin666/dsh-task-board、
+ * @linxin666/dsh-ssh 用的是同一套、已被验证的形态）：
+ *   sidebar.panellist  id = 'dsh-remote-gui'   ← 侧栏图标行（外壳拥有按钮/高亮/收起态）
+ *   main              key = 'dsh-remote-gui'   ← 中心列页面（同 key 才会被切到）
+ *   sidebar.footer.action id = 'dsh-remote-gui' ← 页脚小入口（点它也是切到上面的主面板）
+ * 所以它**不盖住左侧栏、没有遮罩、没有滚动锁**；关闭 = 让主列切回 'conversation'
+ * （✕ / Esc / 或直接点侧栏里的会话）。切走时就地卸载，不留任何东西。
  *
  * ── 注册方式 ────────────────────────────────────────────────────────────────
- * 由宿主按 package.json 的 `dsh.client`（platform: web）扫描到，
  * 浏览器侧通过 `window.__ModuleLoader__.load({ id, factory })` 加载本文件，
- * 取 `module.exports = { apply, inject }`。`apply(ctx)` 里用 `ctx.effect(fn, label)`
- * 挂载带清理函数的副作用。
+ * 取 `module.exports = { apply, inject }`；`apply(ctx)` 里用 `ctx.effect(fn, label)`
+ * 挂带清理函数的副作用，用 `ctx.slots.inject(key, cb)` 等宿主声明插槽后再 register。
  *
- * ── 契约（与 docs/SPEC.md 逐条对齐；不要改这里的路径）─────────────────────────
- *   GET    /api/dsh-remote-gui/hosts            → { hosts: Host[] }
- *   POST   /api/dsh-remote-gui/hosts            ← { alias, name?, port?, localPort?, autoTunnel? }
- *                                               → { host: Host }
- *   DELETE /api/dsh-remote-gui/host?id=         → { ok: true }
- *   POST   /api/dsh-remote-gui/tunnel           ← { id, action: 'start'|'stop' }  → { tunnel: Tunnel }
- *   GET    /api/dsh-remote-gui/sessions?id=     → { sessions: Session[] }
- *   POST   /api/dsh-remote-gui/session-archive  ← { id, sessionId }               → { ok, archivedSessionIds }
- *   GET    /api/dsh-remote-gui/seed?id=         → { url: string }
- *   GET    /api/dsh-remote-gui/health?id=       → { id, tunnel, hostUp, status }
+ * ── 契约（宿主半边 /api/dsh-remote-gui/*；同源，不需要额外凭据）──────────────
+ *   GET    /hosts                      → { hosts: Host[] }
+ *   POST   /hosts                      ← { alias, name?, port?, localPort?, autoTunnel? }
+ *   DELETE /host?id=                   → { ok: true }
+ *   POST   /tunnel                     ← { id, action:'start'|'stop' }
+ *   GET    /health?id=                 → { id, tunnel, hostUp, status }
+ *   GET    /sessions?id=               → { sessions: Session[] }
+ *   POST   /session-archive            ← { id, sessionId }
+ *   GET    /session-page?id=&sessionId=&throughSeq=&maxMessages=&beforeSeq=
+ *                                      → { records:[{type:'event',event:{…}}], hasMore }
+ *   GET    /session-projection?id=&sessionId=  → { projection }
+ *   POST   /session-prompt             ← { id, sessionId, text, mode?, probe? }
+ *   POST   /session-create             ← { id, cwd? }   → { ok, sessionId }
  *
- *   Host    = { id, alias, name, port, localPort, autoTunnel, tunnel?:Tunnel, seedUrl?:string }
- *   Tunnel  = { localPort, remotePort, alias, state:'starting'|'running'|'stopped', exitCode:number|null }
- *   Session = { sessionId, title:string|null, running:boolean, blank:boolean,
- *               updatedAt:number, cwd:string|null, turns:number|null }
- *
- * 说明：所有请求都是同源（本机 GUI 的 origin），不需要额外凭据。
- *      iframe 指向隧道端口 —— 那是**浏览器自己**发请求，所以要用带 token 的
- *      seedUrl 先加载一次，让远端把凭据 cookie 种进浏览器（详见 SPEC「seedUrl」）。
+ * ⚠️ 远端 `session/page` 的 `throughSeq` **不能超过该会话的 cursor**（= projection.asOfSeq），
+ *    否则远端回 `gateway/bad-request: session page through seq N is past cursor M`。
+ *    本文件的做法：每轮先读 projection 拿 asOfSeq，再按它取 page。
+ * ⚠️ 刷新是**轮询**（默认 3 秒），不是 WebSocket 实时流 —— 界面上如实写着"轮询"。
+ *    真流式要开远端网关的 `/api/remote.mux` WebSocket（`session/follow`），那是下一步的事。
  */
+
 window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
   var module = { exports: {} };
   var exports = module.exports;
 
   var React = require("react");
-  var ReactDOM = require("react-dom/client");
 
   var h = React.createElement;
   var useState = React.useState;
@@ -48,9 +57,14 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
    * ⚠️ 不要在这里加 betterSidebar —— 本机整套插件与 harness 本体都没有提供这个服务
    * （实测：app.asar 里 0 次命中，已装插件里无人注册）。cordis 的 inject 是**必需**
    * 依赖，列一个不存在的服务会让整个客户端半边永远不激活（面板根本不出现）。
-   * 代码里对 ctx.betterSidebar 的用法已经做了可选降级。
+   * 代码里对 ctx.betterSidebar / ctx.layout 的用法都做了 typeof 守卫 + try/catch。
    */
   var inject = ["slots", "connection", "locale"];
+
+  /** 侧栏行 id 与中心列 key 必须**是同一个字符串**（sidebar.panellist 的 id 寻址 main 的 key）。 */
+  var PANEL_ID = "dsh-remote-gui";
+  /** 关闭时切回的宿主主面板 key（ui-conversation 占的就是这个 key）。 */
+  var CONVERSATION_PANEL_ID = "conversation";
 
   var API = {
     hosts: "/api/dsh-remote-gui/hosts",
@@ -58,25 +72,28 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     tunnel: "/api/dsh-remote-gui/tunnel",
     sessions: "/api/dsh-remote-gui/sessions",
     archive: "/api/dsh-remote-gui/session-archive",
-    seed: "/api/dsh-remote-gui/seed",
+    page: "/api/dsh-remote-gui/session-page",
+    projection: "/api/dsh-remote-gui/session-projection",
+    prompt: "/api/dsh-remote-gui/session-prompt",
+    create: "/api/dsh-remote-gui/session-create",
     health: "/api/dsh-remote-gui/health"
   };
 
   var HOSTS_POLL_MS = 12000;
   var SESSIONS_POLL_MS = 8000;
-  var HEALTH_POLL_MS = 5000;
-  /**
-   * 选中「本地实例」时，远端会话轮询**降频**而不是停掉。
-   * 停掉会让主机卡上的「N 个远端会话 · M 运行中」变成陈旧值；不降频则会在你根本没看远端的时候
-   * 持续产生远端 RPC 流量（每个主机一次 / 8 秒）。一分钟一次是两者的折中。
-   */
-  var SESSIONS_POLL_IDLE_MS = 60000;
+  /** 打开一条会话时的轮询周期（projection → 有新事件才拉 page）。 */
+  var TRANSCRIPT_POLL_MS = 3000;
+  /** 每次 page 请求的最大消息数（远端会连带返回周边事件，实测 40 条 ≈ 230 条记录）。 */
+  var PAGE_MAX_MESSAGES = 40;
+
+  var TARGET_STORAGE_KEY = "dsh-remote-gui.target";
 
   // ── 小工具 ─────────────────────────────────────────────────────────────────
 
   function qs(url, params) {
     var pairs = [];
     for (var k in params) if (Object.prototype.hasOwnProperty.call(params, k)) {
+      if (params[k] === undefined || params[k] === null) continue;
       pairs.push(encodeURIComponent(k) + "=" + encodeURIComponent(params[k]));
     }
     return pairs.length ? url + "?" + pairs.join("&") : url;
@@ -127,6 +144,11 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     return new Date(ts).toLocaleDateString();
   }
 
+  function clockTime(ts) {
+    if (!ts) return "";
+    try { return new Date(ts).toLocaleTimeString(); } catch (e) { return ""; }
+  }
+
   /** 会话标题：title → cwd 末段 → sessionId 前 8 位。 */
   function sessionTitle(s) {
     if (s && s.title) return s.title;
@@ -144,85 +166,171 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     return "…/" + parts.slice(-2).join("/");
   }
 
-  /** 错误对象 → 可读文字（宿主在失败时返回 {error}）。 */
+  /** 错误对象 → 可读文字（宿主在失败时返回 {error}；远端错误是 {code,message} 对象）。 */
   function errText(data, fallback) {
     if (!data) return fallback;
     if (typeof data.error === "string") return data.error;
-    if (data.error && typeof data.error.message === "string") return data.error.message;
+    if (data.error && typeof data.error.message === "string") {
+      return (data.error.code ? data.error.code + ": " : "") + data.error.message;
+    }
     return fallback;
   }
 
-  // ── 目标：本地实例 ↔ 远端（SSH 隧道）────────────────────────────────────────
-  // 同一个面板既能看本机这个 DSH，也能看经隧道的那台。差别只有两处：
-  // 会话列表从哪取、iframe 指哪。
+  /** 供标题/占位用：截断长文本。 */
+  function clip(text, n) {
+    var s = String(text === undefined || text === null ? "" : text);
+    return s.length > n ? s.slice(0, n) + "…" : s;
+  }
 
-  var TARGET_LOCAL = "local";
-  var TARGET_STORAGE_KEY = "dsh-remote-gui.target";
-
-  /** 读回上次选择的目标；storage 不可用（隐私模式等）时退回「本地实例」。 */
+  /** 目标主机的持久化选择（只存主机 id；不再有"本地实例"这个目标）。 */
   function readStoredTarget() {
     try {
       var v = window.localStorage.getItem(TARGET_STORAGE_KEY);
-      return v ? String(v) : TARGET_LOCAL;
+      return v ? String(v) : "";
     } catch (e) {
-      return TARGET_LOCAL;
+      return "";
     }
   }
 
-  /** 记住选择；storage 不可用时静默忽略。 */
   function writeStoredTarget(value) {
     try { window.localStorage.setItem(TARGET_STORAGE_KEY, String(value)); } catch (e) { /* 忽略 */ }
   }
 
-  /**
-   * 服务端会话条目 → 面板统一形状。
-   * 字段与宿主半边（lib/index.js 的 session/list 映射）逐字一致：
-   * 远端和本地是同一份服务端代码，所以两边可以共用这一个映射与同一套行渲染。
-   */
-  function mapSessionItem(s) {
-    var values = s && s.projections && s.projections.values;
-    return {
-      sessionId: s && s.sessionId,
-      title: (values && values.title) || null,
-      running: !!(s && s.running),
-      blank: !!(s && s.blank),
-      updatedAt: s && s.updatedAt,
-      cwd: (s && s.cwd) || null,
-      turns: (values && values.sessionStats && values.sessionStats.turns) || null
-    };
+  function hasStoredTarget() {
+    try {
+      var v = window.localStorage.getItem(TARGET_STORAGE_KEY);
+      return v !== null && v !== undefined && String(v) !== "";
+    } catch (e) {
+      return false;
+    }
   }
 
-  /**
-   * 本地实例的会话列表：**相对路径**打 GUI 自己的 origin（同源，凭据天然带着），
-   * 信封与远端完全一致，数据同样在 result.value.items。
-   * ⚠️ 本地分支不碰宿主的远端路由（那些 /api/dsh-remote-gui/* 是隧道通道）。
-   */
-  function fetchLocalSessions() {
-    return fetch("/api/session/list", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        type: "client-request",
-        rpcId: "local-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
-        method: "session/list",
-        payload: { args: { _request: {} } }
-      })
-    }).then(function (r) {
-      return r.json();
-    }).then(function (data) {
-      var result = data && data.result;
-      if (!result || result.ok !== true) {
-        throw new Error(errText({ error: result && result.error }, "本地会话 RPC 失败"));
-      }
-      var items = (result.value && result.value.items) || [];
-      return items.map(mapSessionItem);
+  // ── 消息流：把远端 session/page 的 records 变成可读条目 ─────────────────────
+  //
+  // 事件形状（2026-10-14 从真远端 session/page 的响应里读出来的，逐条实测）：
+  //   user/message      data.content[]                    ← 用户输入（text/image）
+  //   assistant/message data.message.content[]            ← text / reasoning / tool-call 三种块
+  //                     data.usage
+  //   tool/call         data.callId, data.name, data.arguments(JSON 字符串)
+  //   tool/result       data.message.content[] + data.message.isError, data.toolCallId
+  //                     data.sourceEventSeqs[]（指向那条 tool/call 的 seq，用来配对）
+  //   turn/start|end, step/start|end, todo/write, …       ← 结构噪声，不渲染
+  //
+  // 去重规则：tool-call 块在 assistant/message 里也会出现一次，所以工具卡只从
+  // **tool/call 事件**生成，assistant/message 只取 text（避免同一调用画两遍）。
+
+  /** 把 content 块数组里的纯文本拼起来（跳过 reasoning / tool-call / image）。 */
+  function textBlocks(content) {
+    var out = [];
+    if (!content || !content.length) return "";
+    for (var i = 0; i < content.length; i++) {
+      var b = content[i];
+      if (b && b.type === "text" && typeof b.text === "string") out.push(b.text);
+      else if (b && b.type === "image") out.push("[图片]");
+    }
+    return out.join("\n");
+  }
+
+  function hasImageBlock(content) {
+    if (!content || !content.length) return false;
+    for (var i = 0; i < content.length; i++) if (content[i] && content[i].type === "image") return true;
+    return false;
+  }
+
+  /** records → 渲染条目（按 seq 升序；工具卡与它的 result 配成一张）。 */
+  function buildItems(records) {
+    var items = [];
+    var byCallId = {};      // callId → items 下标
+    var list = (records || []).slice();
+    list.sort(function (a, b) {
+      var sa = a && a.event && typeof a.event.seq === "number" ? a.event.seq : 0;
+      var sb = b && b.event && typeof b.event.seq === "number" ? b.event.seq : 0;
+      return sa - sb;
     });
+    for (var i = 0; i < list.length; i++) {
+      var ev = list[i] && list[i].event;
+      if (!ev || !ev.type) continue;
+      var data = ev.data || {};
+      var seq = typeof ev.seq === "number" ? ev.seq : i;
+      if (ev.type === "user/message") {
+        var utext = textBlocks(data.content);
+        if (!utext && !hasImageBlock(data.content)) continue;
+        items.push({ key: "u" + seq, kind: "user", seq: seq, time: ev.time, text: utext });
+      } else if (ev.type === "assistant/message") {
+        var msg = data.message || {};
+        var atext = textBlocks(msg.content);
+        if (!atext) continue;   // 只有工具调用/思考、没有正文 → 由 tool/call 卡片代表
+        items.push({ key: "a" + seq, kind: "assistant", seq: seq, time: ev.time, text: atext });
+      } else if (ev.type === "tool/call") {
+        var callId = data.callId || ("seq" + seq);
+        var args = data.arguments;
+        items.push({
+          key: "c" + seq,
+          kind: "tool",
+          seq: seq,
+          time: ev.time,
+          callId: callId,
+          name: data.name || "(未知工具)",
+          args: typeof args === "string" ? args : (args === undefined ? "" : JSON.stringify(args)),
+          result: null,
+          isError: false
+        });
+        byCallId[callId] = items.length - 1;
+      } else if (ev.type === "tool/result") {
+        var rmsg = data.message || {};
+        var rtext = textBlocks(rmsg.content);
+        var rid = data.toolCallId || rmsg.toolCallId;
+        var at = rid !== undefined && rid !== null ? byCallId[rid] : undefined;
+        if (at !== undefined && items[at] && items[at].result === null) {
+          items[at] = Object.assign({}, items[at], { result: rtext, isError: !!rmsg.isError });
+        } else {
+          items.push({
+            key: "r" + seq,
+            kind: "tool",
+            seq: seq,
+            time: ev.time,
+            callId: rid || ("seq" + seq),
+            name: "(工具结果)",
+            args: "",
+            result: rtext,
+            isError: !!rmsg.isError
+          });
+        }
+      }
+      // 其余事件（turn/step/session-log/…）不渲染：它们是结构记录，不是对话内容
+    }
+    return items;
   }
 
-  // ── 面板 ───────────────────────────────────────────────────────────────────
+  /** 按 seq 去重合并（轮询整窗替换 + "加载更早"向前拼接都走这里）。 */
+  function mergeBySeq(existing, incoming) {
+    var seen = {};
+    var all = (existing || []).concat(incoming || []);
+    var out = [];
+    for (var i = 0; i < all.length; i++) {
+      var ev = all[i] && all[i].event;
+      var seq = ev && typeof ev.seq === "number" ? ev.seq : null;
+      if (seq === null) { out.push(all[i]); continue; }
+      if (seen[seq]) continue;
+      seen[seq] = true;
+      out.push(all[i]);
+    }
+    out.sort(function (a, b) {
+      var sa = a && a.event && typeof a.event.seq === "number" ? a.event.seq : 0;
+      var sb = b && b.event && typeof b.event.seq === "number" ? b.event.seq : 0;
+      return sa - sb;
+    });
+    return out;
+  }
 
-  function RemoteGuiPanel() {
+  // ── 主面板（中心列；同 key 才被切到）────────────────────────────────────────
+
+  /**
+   * @param props.closePanel 由注册时的 inject face 注入：把主列切回会话页。
+   */
+  function RemoteSessionsPanel(props) {
+    var closePanel = props && props.closePanel;
+
     var hostsState = useState([]);
     var hosts = hostsState[0];
     var setHosts = hostsState[1];
@@ -239,50 +347,59 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     var alias = aliasState[0];
     var setAlias = aliasState[1];
 
-    var sessionsState = useState({});
-    var sessionsByHost = sessionsState[0];
-    var setSessionsByHost = sessionsState[1];
-
-    var healthState = useState({});
-    var healthByHost = healthState[0];
-    var setHealthByHost = healthState[1];
-
-    var seedState = useState({});
-    var seedByHost = seedState[0];
-    var setSeedByHost = seedState[1];
+    var sessionsState = useState([]);
+    var sessions = sessionsState[0];
+    var setSessions = sessionsState[1];
 
     var busyState = useState(null);
     var busy = busyState[0];
     var setBusy = busyState[1];
 
-    var frameNonceState = useState(0);
-    var frameNonce = frameNonceState[0];
-    var setFrameNonce = frameNonceState[1];
-
-    // 目标：TARGET_LOCAL 或某台远端主机的 id（持久化在 localStorage）
     var targetState = useState(readStoredTarget);
     var target = targetState[0];
     var setTarget = targetState[1];
 
-    var localSessionsState = useState([]);
-    var localSessions = localSessionsState[0];
-    var setLocalSessions = localSessionsState[1];
+    /** 打开的会话：{sessionId,title,cwd,records,hasMore,asOf,loading,error,updatedAt} */
+    var openState = useState(null);
+    var open = openState[0];
+    var setOpen = openState[1];
 
-    var localErrorState = useState(null);
-    var localError = localErrorState[0];
-    var setLocalError = localErrorState[1];
+    var draftState = useState("");
+    var draft = draftState[0];
+    var setDraft = draftState[1];
 
-    /** 切换目标并记住它。 */
-    var selectTarget = useCallback(function (next) {
-      setTarget(next);
-      writeStoredTarget(next);
-    }, []);
+    var sendState = useState(null);   // { kind:'ok'|'err'|'info', text }
+    var sendMsg = sendState[0];
+    var setSendMsg = sendState[1];
+
+    var steerState = useState(false);
+    var steer = steerState[0];
+    var setSteer = steerState[1];
 
     var mountedRef = useRef(true);
     useEffect(function () {
       mountedRef.current = true;
       return function () { mountedRef.current = false; };
     }, []);
+
+    var selectTarget = useCallback(function (next) {
+      setTarget(next);
+      writeStoredTarget(next);
+    }, []);
+
+    /**
+     * 默认目标：用户上次选过就尊重它；从没选过时有主机就自动选**第一台远端**
+     * （只有一台主机都没有才停在没有目标的状态）。
+     * 为什么这么默认：用户要的是"连上远端就用远端会话"，让面板一打开就是空的、
+     * 还要手动选一次主机，等于把最常走的路放到了最后。ref 保证一辈子只套用一次。
+     */
+    var defaultTargetAppliedRef = useRef(false);
+    useEffect(function () {
+      if (defaultTargetAppliedRef.current) return;
+      if (loading) return;
+      defaultTargetAppliedRef.current = true;
+      if (!hasStoredTarget() && hosts.length > 0) selectTarget(hostId(hosts[0]));
+    }, [loading, hosts, selectTarget]);
 
     // 主机列表：挂载时拉一次，之后定时刷新
     var refreshHosts = useCallback(function () {
@@ -307,117 +424,171 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
       return function () { window.clearInterval(timer); };
     }, [refreshHosts]);
 
-    // 目标解析：
-    //   目标 = local            → 本地模式
-    //   目标指向仍存在的主机     → 远端模式（就那台）
-    //   目标指向已删除的主机     → 主机列表读完后回落到本地模式（下面用 effect 纠正持久化值）
-    var targetIsRemote = target !== TARGET_LOCAL;
+    // 目标解析（目标不见了就回落，等主机列表读完再判定，避免闪一下）
     var activeHost = null;
-    if (targetIsRemote) {
-      for (var i = 0; i < hosts.length; i++) {
-        if (hostId(hosts[i]) === target) { activeHost = hosts[i]; break; }
-      }
+    for (var hi = 0; hi < hosts.length; hi++) {
+      if (hostId(hosts[hi]) === target) { activeHost = hosts[hi]; break; }
     }
-    // 主机列表还没读完时不要急着判定"目标不见了"，避免开面板瞬间先嵌本地再换远端
-    var isLocalTarget = !targetIsRemote || (!loading && activeHost === null);
     var activeHostKey = activeHost ? hostId(activeHost) : "";
+    var tunnelRunning = !!activeHost && tunnelState(activeHost) === "running";
 
-    // 目标主机已被删除 → 把持久化值纠正回「本地实例」（只会在确定后触发一次）
     useEffect(function () {
-      if (targetIsRemote && !loading && activeHost === null) selectTarget(TARGET_LOCAL);
-    }, [targetIsRemote, loading, activeHost, selectTarget]);
+      if (loading) return;
+      if (target && activeHost === null) selectTarget(hosts.length > 0 ? hostId(hosts[0]) : "");
+    }, [loading, target, activeHostKey, hosts, selectTarget]);
 
-    // 健康检查：只查隧道在跑的主机
-    useEffect(function () {
-      var timer = window.setInterval(function () {
-        hosts.forEach(function (host) {
-          if (tunnelState(host) !== "running") return;
-          var id = hostId(host);
-          getJson(qs(API.health, { id: id })).then(function (d) {
-            if (!mountedRef.current) return;
-            setHealthByHost(function (prev) {
-              var next = {};
-              for (var k in prev) if (Object.prototype.hasOwnProperty.call(prev, k)) next[k] = prev[k];
-              next[id] = { hostUp: !!(d && d.hostUp), status: d && d.status };
-              return next;
-            });
-          }).catch(function () { /* 健康检查失败不影响主流程 */ });
-        });
-      }, HEALTH_POLL_MS);
-      return function () { window.clearInterval(timer); };
-    }, [hosts]);
-
-    // 远端会话：Tunnel 在跑的主机都拉一次
+    // 当前目标的远端会话列表
     var refreshSessions = useCallback(function () {
-      hosts.forEach(function (host) {
-        if (tunnelState(host) !== "running") return;
-        var id = hostId(host);
-        getJson(qs(API.sessions, { id: id })).then(function (d) {
-          if (!mountedRef.current) return;
-          if (d && Array.isArray(d.sessions)) {
-            setSessionsByHost(function (prev) {
-              var next = {};
-              for (var k in prev) if (Object.prototype.hasOwnProperty.call(prev, k)) next[k] = prev[k];
-              next[id] = d.sessions;
-              return next;
-            });
-          }
-        }).catch(function () { /* 会话列表失败：面板显示"读取中/不可用"，不打断 UI */ });
-      });
-    }, [hosts]);
+      if (!activeHostKey) return Promise.resolve();
+      return getJson(qs(API.sessions, { id: activeHostKey })).then(function (d) {
+        if (!mountedRef.current) return;
+        if (d && Array.isArray(d.sessions)) {
+          setSessions(d.sessions);
+          setError(null);
+        } else if (d && d.error) {
+          setError(errText(d, "读取远端会话失败"));
+        }
+      }).catch(function () { /* 列表失败不打断界面 */ });
+    }, [activeHostKey]);
 
     useEffect(function () {
       void refreshSessions();
-      // 本地实例被选中时降频（见 SESSIONS_POLL_IDLE_MS 的说明）：主机卡仍能显示会话数，
-      // 但不会在你看着本地的时候每 8 秒打一轮远端 RPC。
-      var interval = isLocalTarget ? SESSIONS_POLL_IDLE_MS : SESSIONS_POLL_MS;
-      var timer = window.setInterval(function () { void refreshSessions(); }, interval);
+      if (!activeHostKey) return undefined;
+      var timer = window.setInterval(function () { void refreshSessions(); }, SESSIONS_POLL_MS);
       return function () { window.clearInterval(timer); };
-    }, [refreshSessions, isLocalTarget]);
+    }, [refreshSessions, activeHostKey]);
 
-    // 本地实例的会话：**只在选中「本地实例」且主机列表已读完时**轮询；
-    // 切走时把定时器清掉并置 cancelled，保证不会有留在后台跑的本地轮询。
+    var openSession = useCallback(function (session) {
+      setSendMsg(null);
+      setDraft("");
+      setOpen({
+        sessionId: session.sessionId,
+        title: sessionTitle(session),
+        cwd: session.cwd || null,
+        records: [],
+        hasMore: false,
+        asOf: null,
+        loading: true,
+        error: null,
+        updatedAt: null
+      });
+    }, []);
+
+    /**
+     * 正文字幕的轮询：**先读 projection 拿 cursor（asOfSeq），再按它取 page**。
+     * 这样既不会踩 "through seq N is past cursor M"，又能在没有新事件时只花一次
+     * 小请求（projection）而不重复拉整页记录。
+     * 这是**轮询**，不是实时流 —— 界面上如实标注。
+     */
     useEffect(function () {
-      if (!isLocalTarget || loading) return undefined;
+      var sessionId = open && open.sessionId;
+      if (!sessionId || !activeHostKey || !tunnelRunning) return undefined;
       var cancelled = false;
-      var load = function () {
-        fetchLocalSessions().then(function (list) {
+      var loadPage = function (asOf) {
+        return getJson(qs(API.page, {
+          id: activeHostKey,
+          sessionId: sessionId,
+          throughSeq: asOf,
+          maxMessages: PAGE_MAX_MESSAGES
+        })).then(function (p) {
           if (cancelled || !mountedRef.current) return;
-          setLocalSessions(list);
-          setLocalError(null);
-        }).catch(function (e) {
-          if (cancelled || !mountedRef.current) return;
-          setLocalError(e && e.message ? e.message : String(e));
+          if (p && Array.isArray(p.records)) {
+            setOpen(function (prev) {
+              if (!prev || prev.sessionId !== sessionId) return prev;
+              return Object.assign({}, prev, {
+                records: prev.records.length ? mergeBySeq(prev.records, p.records) : p.records,
+                hasMore: !!p.hasMore,
+                asOf: asOf,
+                loading: false,
+                error: null,
+                updatedAt: Date.now()
+              });
+            });
+          } else {
+            setOpen(function (prev) {
+              if (!prev || prev.sessionId !== sessionId) return prev;
+              return Object.assign({}, prev, { loading: false, error: errText(p, "读取远端会话正文失败") });
+            });
+          }
         });
       };
-      load();
-      var timer = window.setInterval(load, SESSIONS_POLL_MS);
-      return function () {
-        cancelled = true;
-        window.clearInterval(timer);
-      };
-    }, [isLocalTarget, loading]);
-
-    // iframe 的种子地址：宿主在 hosts 里给 seedUrl 时直接用；
-    // 万一没给（或过期），用 /seed 现取一次，让远端把凭据 cookie 种进浏览器。
-    useEffect(function () {
-      if (!activeHost) return;
-      if (tunnelState(activeHost) !== "running") return;
-      if (activeHost.seedUrl) return;
-      var id = hostId(activeHost);
-      if (seedByHost[id]) return;
-      getJson(qs(API.seed, { id: id })).then(function (d) {
-        if (!mountedRef.current) return;
-        if (d && typeof d.url === "string" && d.url) {
-          setSeedByHost(function (prev) {
-            var next = {};
-            for (var k in prev) if (Object.prototype.hasOwnProperty.call(prev, k)) next[k] = prev[k];
-            next[id] = d.url;
-            return next;
+      var tick = function () {
+        return getJson(qs(API.projection, { id: activeHostKey, sessionId: sessionId })).then(function (d) {
+          if (cancelled || !mountedRef.current) return;
+          var proj = d && d.projection;
+          var asOf = proj && typeof proj.asOfSeq === "number" ? proj.asOfSeq : null;
+          if (asOf === null) {
+            setOpen(function (prev) {
+              if (!prev || prev.sessionId !== sessionId || prev.records.length) return prev;
+              return Object.assign({}, prev, { loading: false, error: errText(d, "读取远端会话投影失败") });
+            });
+            return;
+          }
+          var needPage = true;
+          if (mountedRef.current) {
+            setOpen(function (prev) {
+              if (!prev || prev.sessionId !== sessionId) return prev;
+              if (prev.asOf === asOf && prev.records.length) { needPage = false; return prev; }
+              return Object.assign({}, prev, { asOf: asOf });
+            });
+          }
+          if (!needPage) {
+            setOpen(function (prev) {
+              if (!prev || prev.sessionId !== sessionId) return prev;
+              return Object.assign({}, prev, { updatedAt: Date.now() });
+            });
+            return;
+          }
+          return loadPage(asOf);
+        }).catch(function (e) {
+          if (cancelled || !mountedRef.current) return;
+          setOpen(function (prev) {
+            if (!prev || prev.sessionId !== sessionId) return prev;
+            return Object.assign({}, prev, { loading: false, error: String(e) });
           });
-        }
-      }).catch(function () { /* 拿不到种子地址就退回裸地址 */ });
-    }, [activeHostKey, activeHost && activeHost.seedUrl, activeHost && tunnelState(activeHost)]);
+        });
+      };
+      void tick();
+      var timer = window.setInterval(function () { void tick(); }, TRANSCRIPT_POLL_MS);
+      return function () { cancelled = true; window.clearInterval(timer); };
+      // open.sessionId 是这里的真正依赖；open.asOf 变化不重挂（否则每轮都重建定时器）
+    }, [open && open.sessionId, activeHostKey, tunnelRunning]);
+
+    /** 加载更早：以当前最老的 seq 为 beforeSeq 再取一页。 */
+    var loadOlder = useCallback(function () {
+      var sessionId = open && open.sessionId;
+      if (!sessionId || !activeHostKey) return;
+      var records = open.records || [];
+      var oldest = null;
+      for (var i = 0; i < records.length; i++) {
+        var sq = records[i] && records[i].event && records[i].event.seq;
+        if (typeof sq === "number" && (oldest === null || sq < oldest)) oldest = sq;
+      }
+      if (oldest === null || open.asOf === null) return;
+      setBusy("older");
+      getJson(qs(API.page, {
+        id: activeHostKey,
+        sessionId: sessionId,
+        throughSeq: open.asOf,
+        beforeSeq: oldest,
+        maxMessages: PAGE_MAX_MESSAGES
+      })).then(function (p) {
+        if (!mountedRef.current) return;
+        setOpen(function (prev) {
+          if (!prev || prev.sessionId !== sessionId) return prev;
+          if (!p || !Array.isArray(p.records)) return Object.assign({}, prev, { error: errText(p, "加载更早的消息失败") });
+          return Object.assign({}, prev, {
+            records: mergeBySeq(prev.records, p.records),
+            hasMore: !!p.hasMore,
+            error: null
+          });
+        });
+      }).catch(function (e) {
+        if (mountedRef.current) setOpen(function (prev) { return prev ? Object.assign({}, prev, { error: String(e) }) : prev; });
+      }).then(function () {
+        if (mountedRef.current) setBusy(null);
+      });
+    }, [open && open.sessionId, open && open.asOf, open && open.records, activeHostKey]);
 
     function withBusy(key, fn) {
       setBusy(key);
@@ -465,7 +636,7 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
         return sendJson(qs(API.host, { id: id }), "DELETE").then(function (d) {
           if (!mountedRef.current) return;
           if (d && d.ok === false) setError(errText(d, "删除失败"));
-          if (target === id) selectTarget(TARGET_LOCAL);
+          if (target === id) selectTarget("");
           return refreshHosts();
         });
       });
@@ -478,12 +649,10 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
         return sendJson(API.archive, "POST", { id: id, sessionId: session.sessionId }).then(function (d) {
           if (!mountedRef.current) return;
           if (d && d.ok) {
-            setSessionsByHost(function (prev) {
-              var next = {};
-              for (var k in prev) if (Object.prototype.hasOwnProperty.call(prev, k)) next[k] = prev[k];
-              next[id] = (prev[id] || []).filter(function (s) { return s.sessionId !== session.sessionId; });
-              return next;
+            setSessions(function (prev) {
+              return (prev || []).filter(function (s) { return s.sessionId !== session.sessionId; });
             });
+            if (open && open.sessionId === session.sessionId) setOpen(null);
             return refreshSessions();
           }
           setError(errText(d, "归档失败"));
@@ -491,98 +660,331 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
       });
     }
 
-    // ── 样式（只用内联 style + CSS 变量，不引外部 CSS）──────────────────────
+    function createSession() {
+      if (!activeHostKey) return;
+      var cwd = open && open.cwd ? open.cwd : undefined;
+      void withBusy("create", function () {
+        return sendJson(API.create, "POST", { id: activeHostKey, cwd: cwd }).then(function (d) {
+          if (!mountedRef.current) return;
+          if (d && d.ok && d.sessionId) {
+            setSendMsg({ kind: "info", text: "已新建远端会话 " + String(d.sessionId).slice(0, 20) + "…" });
+            return refreshSessions().then(function () {
+              if (!mountedRef.current) return;
+              openSession({ sessionId: d.sessionId, title: null, cwd: cwd || null });
+            });
+          }
+          setError(errText(d, "新建远端会话失败"));
+        });
+      });
+    }
+
+    /**
+     * 真发送。⚠️ 这一步会让**远端**真的跑一轮模型并消耗额度，
+     * 所以：① 必须先过 window.confirm；② 只有用户显式点「发送」或按 Ctrl/Cmd+Enter 才会走到这里；
+     * ③ 没有任何自动重试/自动补发。发送后立刻拉一次正文，之后交给轮询。
+     */
+    function sendPrompt() {
+      var sessionId = open && open.sessionId;
+      var text = draft;
+      if (!sessionId || !activeHostKey || !text.trim()) return;
+      if (!window.confirm("发送到远端会话「" + (open.title || String(sessionId).slice(0, 12)) + "」？\n\n"
+        + "⚠️ 这会让远端真的执行一轮模型调用并消耗额度。")) return;
+      setBusy("send");
+      setSendMsg({ kind: "info", text: "已发送，等待远端受理…" });
+      sendJson(API.prompt, "POST", {
+        id: activeHostKey,
+        sessionId: sessionId,
+        text: text,
+        mode: steer ? "steer" : "queue"
+      }).then(function (d) {
+        if (!mountedRef.current) return;
+        if (d && d.ok) {
+          setDraft("");
+          setSendMsg({ kind: "ok", text: "远端已受理（requestId " + clip(d.requestId, 26) + "）—— 正在轮询远端输出" });
+          return getJson(qs(API.projection, { id: activeHostKey, sessionId: sessionId })).then(function (p) {
+            if (!mountedRef.current) return;
+            var asOf = p && p.projection && typeof p.projection.asOfSeq === "number" ? p.projection.asOfSeq : null;
+            if (asOf === null) return undefined;
+            return getJson(qs(API.page, {
+              id: activeHostKey,
+              sessionId: sessionId,
+              throughSeq: asOf,
+              maxMessages: PAGE_MAX_MESSAGES
+            })).then(function (pg) {
+              if (!mountedRef.current) return;
+              setOpen(function (prev) {
+                if (!prev || prev.sessionId !== sessionId) return prev;
+                if (!pg || !Array.isArray(pg.records)) return Object.assign({}, prev, { asOf: asOf });
+                return Object.assign({}, prev, {
+                  records: mergeBySeq(prev.records, pg.records),
+                  hasMore: !!pg.hasMore,
+                  asOf: asOf,
+                  updatedAt: Date.now()
+                });
+              });
+            });
+          });
+        }
+        setSendMsg({ kind: "err", text: "发送失败：" + errText(d, "远端拒绝") });
+      }).catch(function (e) {
+        if (mountedRef.current) setSendMsg({ kind: "err", text: "发送失败：" + String(e) });
+      }).then(function () {
+        if (mountedRef.current) setBusy(null);
+      });
+    }
+
+    /**
+     * 零费用链路探针：`probe:true` 让宿主给远端发一条 content=[] 的 prompt。
+     * 远端会在"解析 Agent / 写会话事件之前"拒掉它（gateway/bad-request），
+     * 于是这条链路（本地路由 → 隧道 → 远端 RPC → 错误回显）被验证，且不产生任何模型调用。
+     */
+    function probePrompt() {
+      var sessionId = open && open.sessionId;
+      if (!sessionId || !activeHostKey) return;
+      setBusy("probe");
+      setSendMsg({ kind: "info", text: "探针发送中（0 费用）…" });
+      sendJson(API.prompt, "POST", { id: activeHostKey, sessionId: sessionId, probe: true })
+        .then(function (d) {
+          if (!mountedRef.current) return;
+          if (d && d.ok) {
+            setSendMsg({ kind: "ok", text: "探针：远端**接受**了空内容（意外）—— 返回值 " + clip(JSON.stringify(d.value), 80) });
+            return;
+          }
+          setSendMsg({ kind: "ok", text: "探针链路通 ✅ 远端原样回显：" + errText(d, "（无错误文本）") });
+        })
+        .catch(function (e) {
+          if (mountedRef.current) setSendMsg({ kind: "err", text: "探针失败：" + String(e) });
+        })
+        .then(function () {
+          if (mountedRef.current) setBusy(null);
+        });
+    }
+
+    // Esc 关闭：只在焦点不在输入控件里时生效（免得打字打到一半被关掉）
+    useEffect(function () {
+      var onKey = function (e) {
+        if (e.key !== "Escape" && e.key !== "Esc") return;
+        var t = e.target;
+        var tag = t && t.tagName ? String(t.tagName).toLowerCase() : "";
+        if (tag === "textarea" || tag === "input") return;
+        if (typeof closePanel === "function") closePanel();
+      };
+      document.addEventListener("keydown", onKey, true);
+      return function () { document.removeEventListener("keydown", onKey, true); };
+    }, [closePanel]);
+
+    // ── 样式 ────────────────────────────────────────────────────────────────
+    // 颜色策略（吃过一次亏，见 git 历史里的"白字白底空块"）：
+    //   面板长在宿主的 React 树里，所以**前景色一律 inherit**，层次用 opacity 表达；
+    //   只有强调色（accent / 错误红 / 状态点）写死，并且背景与前景成对出现，
+    //   不出现"背景靠主题变量、前景写死白"的组合 —— 那种组合在浅色主题下会隐形。
     var sep = "var(--dsw-alias-separator-primary, rgba(128,128,128,.22))";
-    var labelPrimary = "var(--dsw-alias-label-primary, #e6e6e6)";
-    var labelSecond = "var(--dsw-alias-label-secondary, #9aa4b2)";
-    var labelThird = "var(--dsw-alias-label-tertiary, #8a93a6)";
+    var softBg = "var(--dsw-specific-sidebar-nav-item-hover, var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.12)))";
     var accent = "var(--dsw-alias-brand-primary, var(--dsh-accent, #4a7dff))";
-    var hoverBg = "var(--dsw-specific-sidebar-nav-item-hover, rgba(128,128,128,.12))";
 
     var styles = {
-      wrap: { display: "flex", flexDirection: "column", height: "100%", minHeight: 0, color: labelPrimary },
-      bar: { display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", borderBottom: "1px solid " + sep, flexWrap: "wrap" },
+      wrap: { display: "flex", flexDirection: "column", height: "100%", minHeight: 0, color: "inherit" },
+      bar: {
+        display: "flex", alignItems: "center", gap: 8, padding: "10px 14px",
+        borderBottom: "1px solid " + sep, flexWrap: "wrap", flexShrink: 0
+      },
+      title: { fontWeight: 600, fontSize: 14, flexShrink: 0 },
+      sub: { fontSize: 12, opacity: 0.7 },
       input: {
         flex: "1 1 200px", minWidth: 0, padding: "6px 9px", borderRadius: 7,
         border: "1px solid " + sep, background: "transparent", color: "inherit", font: "inherit"
       },
-      primaryBtn: { padding: "6px 12px", borderRadius: 7, border: "none", background: accent, color: "#fff", cursor: "pointer", font: "inherit", flexShrink: 0 },
-      ghostBtn: { padding: "5px 10px", borderRadius: 6, border: "1px solid " + sep, background: "transparent", color: "inherit", cursor: "pointer", font: "inherit", fontSize: 12 },
-      dangerBtn: { padding: "5px 10px", borderRadius: 6, border: "1px solid " + sep, background: "transparent", color: "#e07171", cursor: "pointer", font: "inherit", fontSize: 12 },
-      sectionTitle: { display: "flex", alignItems: "center", gap: 8, padding: "8px 14px 4px", fontSize: 12, color: labelSecond },
-      hostsBox: { padding: "4px 10px 8px", overflow: "auto", maxHeight: "34%", borderBottom: "1px solid " + sep },
-      card: { border: "1px solid " + sep, borderRadius: 9, padding: "8px 10px", marginBottom: 6, cursor: "pointer" },
-      row: { display: "flex", alignItems: "center", gap: 8 },
-      dot: { width: 8, height: 8, borderRadius: "50%", flexShrink: 0 },
-      name: { fontWeight: 600, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-      alias: { fontSize: 11, color: labelThird, flexShrink: 0 },
-      meta: { fontSize: 11, color: labelThird, marginTop: 3 },
-      actions: { display: "flex", gap: 6, marginTop: 7, flexWrap: "wrap" },
-      sessionsBox: { padding: "2px 10px 8px", overflow: "auto", maxHeight: "30%", borderBottom: "1px solid " + sep },
-      sessionRow: { display: "flex", alignItems: "center", gap: 8, padding: "6px 6px", borderRadius: 7, fontSize: 12 },
-      sessionTitle: { flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-      sessionMeta: { fontSize: 11, color: labelThird, flexShrink: 0 },
-      frameWrap: { flex: 1, minHeight: 0, display: "flex", position: "relative", background: "#fff" },
-      frame: { flex: 1, border: 0, minHeight: 0, width: "100%" },
-      hint: { fontSize: 11, color: labelThird, padding: "10px 14px" },
+      btn: {
+        padding: "5px 10px", borderRadius: 6, border: "1px solid " + sep,
+        background: "transparent", color: "inherit", cursor: "pointer", font: "inherit", fontSize: 12, flexShrink: 0
+      },
+      btnOn: {
+        padding: "5px 10px", borderRadius: 6, border: "1px solid " + accent,
+        background: softBg, color: "inherit", cursor: "pointer", font: "inherit", fontSize: 12, fontWeight: 600, flexShrink: 0
+      },
+      btnPrimary: {
+        padding: "6px 14px", borderRadius: 7, border: "1px solid " + accent,
+        background: softBg, color: "inherit", cursor: "pointer", font: "inherit", fontSize: 13, fontWeight: 600, flexShrink: 0
+      },
+      btnQuiet: {
+        padding: "4px 8px", borderRadius: 6, border: "1px solid transparent",
+        background: "transparent", color: "inherit", cursor: "pointer", font: "inherit", fontSize: 12, flexShrink: 0, opacity: 0.85
+      },
+      btnOff: {
+        padding: "6px 14px", borderRadius: 7, border: "1px solid " + sep,
+        background: "transparent", color: "inherit", cursor: "not-allowed", font: "inherit", fontSize: 13, opacity: 0.5, flexShrink: 0
+      },
+      dangerBtn: {
+        padding: "4px 8px", borderRadius: 6, border: "1px solid " + sep,
+        background: "transparent", color: "#e07171", cursor: "pointer", font: "inherit", fontSize: 12, flexShrink: 0
+      },
       chip: {
-        padding: "4px 10px",
-        borderRadius: 999,
-        border: "1px solid " + sep,
-        background: "transparent",
-        color: "inherit",
-        cursor: "pointer",
-        font: "inherit",
-        fontSize: 12,
-        flexShrink: 0,
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 5
+        padding: "4px 10px", borderRadius: 999, border: "1px solid " + sep,
+        background: "transparent", color: "inherit", cursor: "pointer", font: "inherit", fontSize: 12,
+        flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 5
       },
-      chipOn: {
-        borderColor: accent,
-        background: "var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.16))",
-        fontWeight: 600
+      err: { color: "#e07171", fontSize: 12, padding: "8px 14px 0", flexShrink: 0 },
+      body: { flex: 1, minHeight: 0, display: "flex" },
+      listCol: {
+        width: 260, flexShrink: 0, display: "flex", flexDirection: "column", minHeight: 0,
+        borderRight: "1px solid " + sep
       },
+      listHead: { display: "flex", alignItems: "center", gap: 6, padding: "8px 10px", borderBottom: "1px solid " + sep, flexShrink: 0 },
+      listBox: { flex: 1, minHeight: 0, overflow: "auto", padding: "4px 6px" },
+      sessionRow: {
+        display: "flex", alignItems: "center", gap: 7, padding: "6px 7px", borderRadius: 7,
+        fontSize: 12, cursor: "pointer", border: "1px solid transparent"
+      },
+      sessionRowOn: { background: softBg, borderColor: accent },
+      sessionTitle: { flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+      sessionMeta: { fontSize: 11, opacity: 0.65, flexShrink: 0 },
+      detail: { flex: 1, minWidth: 0, display: "flex", flexDirection: "column", minHeight: 0 },
+      detailHead: {
+        display: "flex", alignItems: "center", gap: 8, padding: "8px 12px",
+        borderBottom: "1px solid " + sep, flexWrap: "wrap", flexShrink: 0
+      },
+      transcript: { flex: 1, minHeight: 0, overflow: "auto", padding: "10px 14px" },
+      msg: { marginBottom: 10, fontSize: 13, lineHeight: 1.65, whiteSpace: "pre-wrap", wordBreak: "break-word" },
+      msgUser: { borderLeft: "3px solid " + accent, paddingLeft: 10, background: softBg, borderRadius: 6, padding: "7px 10px" },
+      msgAssistant: { borderLeft: "3px solid transparent", paddingLeft: 10 },
+      roleLabel: { fontSize: 11, opacity: 0.6, marginBottom: 2 },
+      toolCard: { border: "1px solid " + sep, borderRadius: 8, padding: "7px 9px", marginBottom: 10, fontSize: 12 },
+      toolHead: { display: "flex", alignItems: "center", gap: 6, fontWeight: 600 },
+      mono: { fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", fontSize: 11.5, whiteSpace: "pre-wrap", wordBreak: "break-word", opacity: 0.9, marginTop: 5 },
+      toolResult: { marginTop: 6, paddingTop: 6, borderTop: "1px dashed " + sep },
+      composer: { borderTop: "1px solid " + sep, padding: "8px 12px", flexShrink: 0 },
+      textarea: {
+        width: "100%", minHeight: 64, maxHeight: 200, resize: "vertical", padding: "8px 9px",
+        borderRadius: 8, border: "1px solid " + sep, background: "transparent", color: "inherit",
+        font: "inherit", fontSize: 13, boxSizing: "border-box"
+      },
+      composerRow: { display: "flex", alignItems: "center", gap: 8, marginTop: 6, flexWrap: "wrap" },
+      notice: {
+        flex: 1, display: "flex", alignItems: "center", justifyContent: "center",
+        padding: "18px 24px", textAlign: "center", fontSize: 13, lineHeight: 1.8, opacity: 0.8
+      },
+      empty: { fontSize: 12, opacity: 0.65, padding: "10px 6px" },
       badge: {
-        marginLeft: "auto",
-        flexShrink: 0,
-        fontSize: 11,
-        padding: "2px 9px",
-        borderRadius: 999,
-        background: "var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.16))",
-        color: labelSecond,
-        whiteSpace: "nowrap"
+        marginLeft: "auto", flexShrink: 0, fontSize: 11, padding: "2px 9px", borderRadius: 999,
+        background: softBg, color: "inherit", whiteSpace: "nowrap"
       },
-      err: { color: "#e07171", fontSize: 12, padding: "8px 14px 0" },
-      empty: { fontSize: 12, color: labelThird, padding: "10px 6px" }
+      dot: { width: 8, height: 8, borderRadius: "50%", flexShrink: 0 },
+      infoLine: { fontSize: 11.5, padding: "4px 0 0", opacity: 0.85 }
     };
 
-    // 会话数据源：本地模式取本地列表；远端模式取宿主代取的远端列表
-    var currentSessions = isLocalTarget
-      ? localSessions
-      : ((activeHost && sessionsByHost[activeHostKey]) || []);
+    var items = buildItems(open ? open.records : []);
 
-    // iframe 目标：
-    //   本地模式 → location.origin（同源，不需要隧道、也不需要凭据兑换）
-    //   远端模式 → seedUrl（带 token，先把凭据 cookie 种进浏览器）→ /seed 现取 → 裸隧道地址
-    //   （主机列表还没读完且目标是远端时，frameSrc 保持空 —— 避免先嵌本地再换成远端）
-    var frameSrc = "";
-    if (isLocalTarget) {
-      frameSrc = location.origin;
-    } else if (activeHost && tunnelState(activeHost) === "running") {
-      frameSrc = activeHost.seedUrl || seedByHost[activeHostKey] ||
-        ("http://127.0.0.1:" + activeHost.tunnel.localPort + "/");
+    function renderTranscript() {
+      if (!open) {
+        return h("div", { style: styles.notice },
+          h("div", null,
+            h("div", { style: { fontWeight: 600, marginBottom: 6 } }, "从左边选一条远端会话"),
+            h("div", { style: styles.sub }, "点会话标题即读取它的对话正文（远端 session/page），可以直接在下面输入发送。")
+          )
+        );
+      }
+      return h("div", { style: styles.detail },
+        h("div", { style: styles.detailHead },
+          h("span", { style: { fontWeight: 600, fontSize: 13, maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+            open.title || String(open.sessionId).slice(0, 12)),
+          open.cwd ? h("span", { style: styles.sessionMeta, title: open.cwd }, shortCwd(open.cwd)) : null,
+          h("span", { style: styles.sessionMeta, title: open.sessionId }, String(open.sessionId).slice(0, 20) + "…"),
+          h("span", { style: styles.sessionMeta },
+            open.updatedAt ? ("轮询刷新 · 每 " + (TRANSCRIPT_POLL_MS / 1000) + " 秒 · 上次 " + clockTime(open.updatedAt))
+              : ("读取中… 轮询周期 " + (TRANSCRIPT_POLL_MS / 1000) + " 秒")),
+          open.hasMore ? h("button", {
+            type: "button", style: styles.btn, disabled: busy === "older", onClick: loadOlder
+          }, busy === "older" ? "加载中…" : "加载更早") : null,
+          h("button", { type: "button", style: styles.btn, onClick: function () { setOpen(null); } }, "返回列表")
+        ),
+        open.error ? h("div", { style: styles.err }, open.error) : null,
+        h("div", { style: styles.transcript },
+          open.loading && items.length === 0 ? h("div", { style: styles.empty }, "读取远端会话正文…") : null,
+          !open.loading && items.length === 0 ? h("div", { style: styles.empty }, "这条会话没有可显示的消息正文（空会话或只有结构事件）") : null,
+          items.map(function (it) {
+            if (it.kind === "user") {
+              return h("div", { key: it.key, style: Object.assign({}, styles.msg, styles.msgUser) },
+                h("div", { style: styles.roleLabel }, "用户 · " + clockTime(it.time)),
+                h("div", null, it.text)
+              );
+            }
+            if (it.kind === "assistant") {
+              return h("div", { key: it.key, style: Object.assign({}, styles.msg, styles.msgAssistant) },
+                h("div", { style: styles.roleLabel }, "助手 · " + clockTime(it.time)),
+                h("div", null, it.text)
+              );
+            }
+            // 工具卡：name + 入参 + （配对上的）结果
+            return h("div", { key: it.key, style: styles.toolCard },
+              h("div", { style: styles.toolHead },
+                h("span", null, "🔧 " + it.name),
+                h("span", { style: styles.sessionMeta }, clockTime(it.time)),
+                it.isError ? h("span", { style: { color: "#e07171", fontSize: 11 } }, "失败") : null
+              ),
+              it.args ? h("div", { style: styles.mono }, clip(it.args, 1200)) : null,
+              it.result !== null && it.result !== undefined
+                ? h("div", { style: Object.assign({}, styles.toolResult, it.isError ? { color: "#e07171" } : null) },
+                    h("div", { style: styles.roleLabel }, "结果"),
+                    h("div", { style: styles.mono }, clip(it.result, 2000)))
+                : h("div", { style: styles.roleLabel }, "（本轮没有可见结果）")
+            );
+          })
+        ),
+        h("div", { style: styles.composer },
+          h("textarea", {
+            style: styles.textarea,
+            placeholder: "在这里输入，然后点「发送」（或 Ctrl/Cmd+Enter）。发送会让远端真的跑一轮模型、消耗额度。",
+            value: draft,
+            spellCheck: false,
+            onChange: function (e) { setDraft(e.target.value); },
+            onKeyDown: function (e) {
+              if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); sendPrompt(); }
+            }
+          }),
+          h("div", { style: styles.composerRow },
+            h("button", {
+              type: "button",
+              style: (!draft.trim() || busy === "send") ? styles.btnOff : styles.btnPrimary,
+              disabled: !draft.trim() || busy === "send",
+              onClick: sendPrompt
+            }, busy === "send" ? "发送中…" : "发送到远端"),
+            h("label", { style: Object.assign({}, styles.sub, { display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }) },
+              h("input", { type: "checkbox", checked: steer, onChange: function (e) { setSteer(!!e.target.checked); } }),
+              "插话 (steer)"
+            ),
+            h("button", {
+              type: "button",
+              style: styles.btnQuiet,
+              title: "给远端发一条空内容 prompt：远端会在调用模型之前拒掉它，用来验证链路（不产生费用）",
+              disabled: busy === "probe",
+              onClick: probePrompt
+            }, busy === "probe" ? "探针中…" : "RPC 探针（0 费用）")
+          ),
+          sendMsg ? h("div", {
+            style: Object.assign({}, styles.infoLine, sendMsg.kind === "err" ? { color: "#e07171" } : null)
+          }, sendMsg.text) : null
+        )
+      );
     }
 
-    /** 当前目标的显示名（面板里一眼看出本地还是远端）。 */
-    var targetLabel = isLocalTarget
-      ? "本地实例"
-      : ("远端 · " + ((activeHost && (activeHost.name || activeHost.alias)) || "…"));
+    return h("div", { style: styles.wrap, "data-dsh-remote-gui-panel": "" },
 
-    return h("div", { style: styles.wrap },
+      // 顶栏：标题 + 关闭（关闭 = 主列切回会话页，没有遮罩可点，因为压根没有遮罩）
+      h("div", { style: styles.bar },
+        h("span", { style: styles.title }, "远端会话"),
+        h("span", { style: styles.sub }, "SSH 隧道 · 原生面板（无 iframe）"),
+        h("span", { style: styles.badge }, activeHost ? ("当前：" + (activeHost.name || activeHost.alias)) : "没有远端主机"),
+        h("button", {
+          type: "button",
+          "data-dsh-remote-gui-close": "",
+          "aria-label": "关闭远端会话面板（回到会话）",
+          title: "关闭（Esc）— 回到当前会话",
+          style: styles.btn,
+          onClick: function () { if (typeof closePanel === "function") closePanel(); }
+        }, "✕ 关闭")
+      ),
 
-      // 顶部：添加主机 + 刷新
+      // 主机管理与目标选择
       h("div", { style: styles.bar },
         h("input", {
           style: styles.input,
@@ -593,32 +995,23 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
           onKeyDown: function (e) { if (e.key === "Enter") addHost(); }
         }),
         h("button", {
-          style: styles.primaryBtn,
+          type: "button",
+          style: (busy === "add" || !alias.trim()) ? styles.btnOff : styles.btnPrimary,
           onClick: addHost,
           disabled: busy === "add" || !alias.trim()
         }, busy === "add" ? "添加中…" : "添加"),
-        h("button", {
-          style: styles.ghostBtn,
-          onClick: function () { void refreshHosts(); void refreshSessions(); }
-        }, "刷新")
+        h("button", { type: "button", style: styles.btn, onClick: function () { void refreshHosts(); void refreshSessions(); } }, "刷新")
       ),
 
-      // 目标选择器：本地实例 / 每台已注册的远端主机（选择持久化在 localStorage）
       h("div", { style: styles.bar },
-        h("span", { style: { fontSize: 12, color: labelSecond, flexShrink: 0 } }, "目标"),
-        h("button", {
-          type: "button",
-          style: Object.assign({}, styles.chip, isLocalTarget ? styles.chipOn : null),
-          title: "本机这个 DSH 实例（同源，不需要隧道）",
-          onClick: function () { selectTarget(TARGET_LOCAL); }
-        }, "本地实例"),
+        h("span", { style: styles.sub }, "目标"),
         hosts.map(function (host) {
           var id = hostId(host);
-          var on = !isLocalTarget && activeHostKey === id;
+          var on = activeHostKey === id;
           return h("button", {
             key: id,
             type: "button",
-            style: Object.assign({}, styles.chip, on ? styles.chipOn : null),
+            style: on ? styles.btnOn : styles.btn,
             title: "远端 · " + host.alias + "（经 SSH 隧道）",
             onClick: function () { selectTarget(id); }
           },
@@ -626,184 +1019,79 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
             host.name || host.alias
           );
         }),
-        h("span", { style: styles.badge }, "当前：" + targetLabel)
+        hosts.length === 0 && !loading ? h("span", { style: styles.sub }, "还没登记主机 —— 在上面填 SSH 别名后点「添加」") : null,
+        hosts.length === 0 && loading ? h("span", { style: styles.sub }, "读取中…") : null,
+        activeHost ? h("span", { style: styles.sub },
+          "远端 :" + activeHost.port + " → 本地 :" + activeHost.localPort + " · " + stateLabel(tunnelState(activeHost))) : null,
+        activeHost ? h("button", {
+          type: "button",
+          style: styles.btn,
+          disabled: busy === "tunnel:" + activeHostKey,
+          onClick: function () { toggleTunnel(activeHost); }
+        }, busy === "tunnel:" + activeHostKey ? "处理中…" : (tunnelRunning ? "断开隧道" : "连接隧道")) : null,
+        activeHost ? h("button", {
+          type: "button",
+          style: styles.dangerBtn,
+          disabled: busy === "remove:" + activeHostKey,
+          onClick: function () { removeHost(activeHost); }
+        }, "删除主机") : null
       ),
 
       error ? h("div", { style: styles.err }, error) : null,
 
-      // 主机列表
-      h("div", { style: styles.sectionTitle },
-        h("span", null, "远端主机"),
-        h("span", { style: { color: labelThird } }, hosts.length ? "共 " + hosts.length + " 台" : "")
-      ),
-      h("div", { style: styles.hostsBox },
-        hosts.map(function (host) {
-          var id = hostId(host);
-          var state = tunnelState(host);
-          var running = state === "running";
-          var up = healthByHost[id] && healthByHost[id].hostUp;
-          var isActive = !isLocalTarget && activeHostKey === id;
-          var hostSessions = sessionsByHost[id] || [];
-          var runningCount = hostSessions.filter(function (s) { return s.running; }).length;
-          var healthText = "";
-          if (running) {
-            healthText = up ? " · 在线" : " · 隧道通（HTTP " + ((healthByHost[id] && healthByHost[id].status) || "…") + "）";
-          }
-          return h("div", {
-            key: id,
-            style: Object.assign({}, styles.card, {
-              borderColor: isActive ? accent : sep,
-              background: isActive ? hoverBg : "transparent"
-            }),
-            onClick: function () { selectTarget(id); }
-          },
-            h("div", { style: styles.row },
-              h("span", { style: Object.assign({}, styles.dot, { background: stateColor(state) }) }),
-              h("span", { style: styles.name }, host.name || host.alias),
-              h("span", { style: styles.alias }, host.alias),
-              h("span", { style: { marginLeft: "auto", fontSize: 11, color: labelSecond, flexShrink: 0 } }, stateLabel(state))
-            ),
-            h("div", { style: styles.meta },
-              "远端 :" + host.port + " → 本地 :" + host.localPort + healthText
-            ),
-            running ? h("div", { style: styles.meta },
-              hostSessions.length ? hostSessions.length + " 个远端会话 · " + runningCount + " 运行中" : "正在读取远端会话…"
-            ) : null,
-            h("div", { style: styles.actions },
-              h("button", {
-                style: styles.ghostBtn,
-                disabled: busy === "tunnel:" + id,
-                onClick: function (e) { e.stopPropagation(); toggleTunnel(host); }
-              }, busy === "tunnel:" + id ? "处理中…" : (running || state === "starting" ? "停止隧道" : "启动隧道")),
-              h("button", {
-                style: styles.ghostBtn,
-                disabled: !running,
-                onClick: function (e) { e.stopPropagation(); setFrameNonce(frameNonce + 1); }
-              }, "重载界面"),
-              h("button", {
-                style: styles.dangerBtn,
-                disabled: busy === "remove:" + id,
-                onClick: function (e) { e.stopPropagation(); removeHost(host); }
-              }, "删除")
-            )
-          );
-        }),
-        hosts.length === 0 && !loading ? h("div", { style: styles.empty }, "还没有远端主机 —— 在上面填 SSH 别名后点「添加」") : null,
-        hosts.length === 0 && loading ? h("div", { style: styles.empty }, "读取中…") : null
-      ),
-
-      // 会话列表（当前目标：本地实例 或 远端主机）
-      h("div", { style: styles.sectionTitle },
-        h("span", null, isLocalTarget ? "本地会话" : "远端会话"),
-        h("span", { style: { color: labelThird } }, targetLabel + " · " + currentSessions.length + " 个")
-      ),
-      h("div", { style: styles.sessionsBox },
-        // —— 本地实例 ——
-        isLocalTarget && localError ? h("div", { style: styles.empty }, "读取本地会话失败：" + localError) : null,
-        isLocalTarget && !localError && currentSessions.length === 0
-          ? h("div", { style: styles.empty }, "本地还没有会话") : null,
-        // —— 远端主机 ——
-        !isLocalTarget && !activeHost ? h("div", { style: styles.empty }, "先添加并连接一台远端主机") : null,
-        !isLocalTarget && activeHost && tunnelState(activeHost) !== "running"
-          ? h("div", { style: styles.empty }, "隧道未启动 —— 点上面的「启动隧道」") : null,
-        !isLocalTarget && activeHost && tunnelState(activeHost) === "running" && currentSessions.length === 0
-          ? h("div", { style: styles.empty }, "没有读到远端会话（或远端还没有会话）") : null,
-        currentSessions.map(function (s) {
-          return h("div", { key: s.sessionId, style: styles.sessionRow },
-            h("span", { style: Object.assign({}, styles.dot, { background: s.running ? "#3ecf6a" : "#9a9a9a" }) }),
-            h("span", { style: styles.sessionTitle, title: (s.cwd || "") + "\n" + s.sessionId }, sessionTitle(s)),
-            s.cwd ? h("span", { style: styles.sessionMeta }, shortCwd(s.cwd)) : null,
-            h("span", { style: styles.sessionMeta }, s.running ? "运行中" : relTime(s.updatedAt)),
-            // 归档走的是宿主的远端通道，所以只在远端模式给按钮（本地分支不碰那条路由）
-            isLocalTarget ? null : h("button", {
-              style: Object.assign({}, styles.ghostBtn, { border: "none", color: "#e07171", padding: "0 4px" }),
-              title: "归档此会话",
-              disabled: busy === "archive:" + s.sessionId,
-              onClick: function () { archiveSession(activeHost, s); }
-            }, "归档")
-          );
-        })
-      ),
-
-      // 内嵌 GUI：本地实例 = 本机 origin；远端 = 隧道（seedUrl → /seed 兜底 → 裸地址）
-      frameSrc
-        ? h("div", { style: styles.frameWrap },
-            h("iframe", {
-              // key 里带上目标：切换目标时 React 会把旧 iframe 卸载掉，不留后台页面
-              key: (isLocalTarget ? "local" : activeHostKey) + ":" + frameNonce,
-              style: styles.frame,
-              src: frameSrc,
-              title: targetLabel + " GUI"
+      // 主体：左=会话列表，右=对话正文 + 输入
+      h("div", { style: styles.body },
+        h("div", { style: styles.listCol },
+          h("div", { style: styles.listHead },
+            h("span", { style: styles.sub }, "远端会话 · " + (sessions ? sessions.length : 0) + " 条"),
+            h("button", {
+              type: "button",
+              style: styles.btn,
+              title: "在远端新建一条会话（不消耗额度；会真的在远端创建一个新会话）",
+              disabled: !tunnelRunning || busy === "create",
+              onClick: createSession
+            }, busy === "create" ? "新建中…" : "＋ 新建")
+          ),
+          h("div", { style: styles.listBox },
+            !activeHost ? h("div", { style: styles.empty }, "先添加并连接一台远端主机") : null,
+            activeHost && !tunnelRunning ? h("div", { style: styles.empty }, "隧道未连接 —— 点上面的「连接隧道」") : null,
+            tunnelRunning && sessions.length === 0 ? h("div", { style: styles.empty }, "没有读到远端会话（或远端还没有会话）") : null,
+            (sessions || []).map(function (s) {
+              var on = !!open && open.sessionId === s.sessionId;
+              return h("div", {
+                key: s.sessionId,
+                style: Object.assign({}, styles.sessionRow, on ? styles.sessionRowOn : null),
+                title: (s.cwd || "") + "\n" + s.sessionId,
+                onClick: function () { openSession(s); }
+              },
+                h("span", { style: Object.assign({}, styles.dot, { background: s.running ? "#3ecf6a" : "#9a9a9a" }) }),
+                h("span", { style: styles.sessionTitle }, sessionTitle(s)),
+                h("span", { style: styles.sessionMeta }, s.running ? "运行中" : relTime(s.updatedAt)),
+                h("button", {
+                  type: "button",
+                  style: styles.dangerBtn,
+                  title: "归档此会话（远端 workspace/archiveSession）",
+                  disabled: busy === "archive:" + s.sessionId,
+                  onClick: function (e) { e.stopPropagation(); archiveSession(activeHost, s); }
+                }, "归档")
+              );
             })
           )
-        : h("div", { style: styles.hint },
-            isLocalTarget
-              ? "准备本地界面…"
-              : (activeHost && tunnelState(activeHost) === "running"
-                  ? "准备远端界面…"
-                  : "隧道启动后，远端的 DSH 界面会嵌在这里"))
+        ),
+        renderTranscript()
+      )
     );
   }
 
-  // ── 覆盖层面板（纯 DOM 外壳 + React 内容）───────────────────────────────────
+  // ── 插槽里的小组件 ──────────────────────────────────────────────────────────
 
-  var overlay = null;      // { el, root }
-  var overlayListeners = [];   // 页脚按钮订阅"面板开关"，用来同步自己的高亮态
-
-  /** 通知所有页脚订阅者：覆盖层面板开了/关了。 */
-  function notifyOverlayChanged() {
-    for (var i = 0; i < overlayListeners.length; i++) {
-      try { overlayListeners[i](overlay !== null); } catch (e) { /* 单个订阅者出错不影响其它 */ }
-    }
-  }
-
-  function toggleOverlay(open) {
-    if (typeof document === "undefined") return;
-    if (open && overlay === null) {
-      var el = document.createElement("div");
-      el.dataset.dshRemoteGuiOverlay = "";
-      el.style.cssText = "position:fixed;inset:0;z-index:2147483000;display:flex;flex-direction:column;" +
-        "background:var(--dsw-alias-bg-base, var(--dsh-bg, #101014));color:var(--dsw-alias-label-primary, #e6e6e6)";
-
-      var head = document.createElement("div");
-      head.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;" +
-        "padding:10px 16px;border-bottom:1px solid var(--dsw-alias-separator-primary, rgba(128,128,128,.22));font-weight:600";
-      var title = document.createElement("span");
-      title.textContent = "远程 GUI（SSH 隧道）";
-      var close = document.createElement("button");
-      close.type = "button";
-      close.textContent = "✕ 关闭";
-      close.style.cssText = "background:transparent;border:none;color:inherit;font:inherit;font-size:13px;cursor:pointer;padding:4px 10px;border-radius:6px";
-      close.addEventListener("click", function () { toggleOverlay(false); });
-      head.appendChild(title);
-      head.appendChild(close);
-
-      var body = document.createElement("div");
-      body.style.cssText = "flex:1;min-height:0;display:flex;flex-direction:column";
-
-      el.appendChild(head);
-      el.appendChild(body);
-      document.body.appendChild(el);
-
-      var root = ReactDOM.createRoot(body);
-      root.render(h(RemoteGuiPanel));
-      overlay = { el: el, root: root };
-    } else if (!open && overlay !== null) {
-      try { overlay.root.unmount(); } catch (e) { /* 忽略卸载异常 */ }
-      overlay.el.remove();
-      overlay = null;
-    }
-    notifyOverlayChanged();
-  }
-
-  // ── 侧栏页脚入口（图标按钮）─────────────────────────────────────────────────
-
-  /** 页脚那个小图标（用 React 元素画的内联 SVG；不注入 HTML、不依赖外层 DOM）。 */
-  function footerIcon() {
+  /** 侧栏面板行 / 页脚入口共用的图标（外壳给尺寸与选中态，只画字形）。 */
+  function panelIcon(size) {
+    var s = size || 15;
     return h("svg", {
       viewBox: "0 0 16 16",
-      width: 15,
-      height: 15,
+      width: s,
+      height: s,
       fill: "none",
       stroke: "currentColor",
       strokeWidth: 1.3,
@@ -816,51 +1104,26 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     );
   }
 
-  /**
-   * 页脚入口按钮 —— 由 apply() 注册进 `sidebar.footer.action` 插槽。
-   * 只渲染自己这一个图标按钮：不读也不写外层 DOM，样式全部内联。
-   * 点击开/关覆盖层面板；面板打开时通过 overlayListeners 订阅来高亮自己。
-   */
-  function FooterEntry() {
-    var activeState = useState(overlay !== null);
-    var active = activeState[0];
-    var setActive = activeState[1];
+  /** `sidebar.panellist` 的行字形：外壳拥有按钮/标签/高亮/收起态，这里只给图标。 */
+  function SidebarPanelIcon(props) {
+    return h("span", { "data-dsh-panel-entry": PANEL_ID }, panelIcon(props && props.size));
+  }
 
-    useEffect(function () {
-      var listener = function (open) { setActive(open); };
-      overlayListeners.push(listener);
-      setActive(overlay !== null);
-      return function () {
-        var i = overlayListeners.indexOf(listener);
-        if (i >= 0) overlayListeners.splice(i, 1);
-      };
-    }, []);
-
+  /** `sidebar.footer.action` 的小入口：点它切到中心列面板（不再是覆盖层）。 */
+  function FooterEntry(props) {
+    var openPanel = props && props.openPanel;
     return h("button", {
       type: "button",
       "data-dsh-remote-gui-entry": "",
-      "data-active": active ? "true" : undefined,
-      "aria-label": "远程 GUI",
-      "aria-expanded": active ? "true" : "false",
-      title: "远程 GUI（SSH 隧道）",
-      onClick: function () { toggleOverlay(overlay === null); },
+      "aria-label": "远端会话",
+      title: "远端会话（SSH 隧道）",
+      onClick: function () { if (typeof openPanel === "function") openPanel(); },
       style: {
-        width: 30,
-        height: 30,
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 0,
-        flex: "none",
-        border: "none",
-        borderRadius: 8,
-        cursor: "pointer",
-        color: "inherit",
-        background: active
-          ? "var(--dsw-specific-sidebar-nav-item-hover, rgba(128,128,128,.18))"
-          : "transparent"
+        width: 30, height: 30, display: "inline-flex", alignItems: "center", justifyContent: "center",
+        padding: 0, flex: "none", border: "none", borderRadius: 8, cursor: "pointer",
+        color: "inherit", background: "transparent"
       }
-    }, footerIcon());
+    }, panelIcon(15));
   }
 
   // ── 插件入口 ───────────────────────────────────────────────────────────────
@@ -871,34 +1134,76 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
       try { console.error("[dsh-remote-gui] " + phase + " error:", error); } catch (e) { /* noop */ }
     }
 
-    // 页脚入口：注册进正规插槽 `sidebar.footer.action`（不再做 DOM 注入）。
-    // 形态照已验证可用的 @linxin666/dsh-remote-web-ui：
-    //   ctx.slots.inject(slotName, () => ctx.slots.register({ name, id }, Component))
+    /** 切到本插件的主面板（侧栏图标被点时由外壳自己切，这里给页脚入口用）。 */
+    function openPanel() {
+      try {
+        if (ctx.layout && typeof ctx.layout.selectPanel === "function") ctx.layout.selectPanel(PANEL_ID);
+      } catch (error) {
+        fail("layout.selectPanel(" + PANEL_ID + ")", error);
+      }
+    }
+
+    /** 关闭 = 把主列切回会话页（宿主 ui-conversation 占的 key 就是 'conversation'）。 */
+    function closePanel() {
+      try {
+        if (ctx.layout && typeof ctx.layout.selectPanel === "function") {
+          ctx.layout.selectPanel(CONVERSATION_PANEL_ID);
+        }
+      } catch (error) {
+        fail("layout.selectPanel(" + CONVERSATION_PANEL_ID + ")", error);
+      }
+    }
+
+    /**
+     * 中心的原生面板：侧栏图标行（sidebar.panellist，id = PANEL_ID）
+     * ＋ 中心列页面（main，key = PANEL_ID）。
+     * 两处都用 ctx.slots.inject：宿主声明了这两个座位才注册；声明顺序无所谓。
+     */
     try {
       ctx.effect(function () {
-        var disposedEntry = null;
-        var disposeInject = ctx.slots.inject("sidebar.footer.action", function () {
-          try {
-            disposedEntry = ctx.slots.register({
-              name: "sidebar.footer.action",
-              id: "dsh-remote-gui"
-            }, FooterEntry);
-          } catch (error) {
-            fail("slots.register sidebar.footer.action", error);
-            disposedEntry = null;
+        var disposers = [];
+
+        // 侧栏图标行：外壳拥有按钮/标签/高亮/收起栏，插件只画字形
+        disposers.push(ctx.slots.inject("sidebar.panellist", function () {
+          return ctx.slots.register({
+            name: "sidebar.panellist",
+            id: PANEL_ID,
+            order: 50,
+            label: function () { return "远端会话"; }
+          }, SidebarPanelIcon);
+        }));
+
+        // 中心列页面：同 key 才会被侧栏那一行切到；关闭靠 closePanel()
+        disposers.push(ctx.slots.inject("main", function () {
+          return ctx.slots.register({
+            name: "main",
+            key: PANEL_ID,
+            inject: function () { return { closePanel: closePanel }; }
+          }, RemoteSessionsPanel);
+        }));
+
+        return function () {
+          for (var i = 0; i < disposers.length; i++) {
+            try { if (typeof disposers[i] === "function") disposers[i](); } catch (e) { /* noop */ }
           }
-          return function () {
-            if (typeof disposedEntry === "function") {
-              try { disposedEntry(); } catch (e) { /* noop */ }
-              disposedEntry = null;
-            }
-          };
+          disposers.length = 0;
+        };
+      }, "dsh-remote-gui: sidebar panellist + main panel");
+    } catch (error) {
+      fail("main panel registration", error);
+    }
+
+    // 页脚入口（次要入口，保留用户原有的位置习惯）：点它切到同一个主面板
+    try {
+      ctx.effect(function () {
+        var disposeInject = ctx.slots.inject("sidebar.footer.action", function () {
+          return ctx.slots.register({
+            name: "sidebar.footer.action",
+            id: PANEL_ID,
+            inject: function () { return { openPanel: openPanel }; }
+          }, FooterEntry);
         });
         return function () {
-          if (typeof disposedEntry === "function") {
-            try { disposedEntry(); } catch (e) { /* noop */ }
-            disposedEntry = null;
-          }
           if (typeof disposeInject === "function") {
             try { disposeInject(); } catch (e) { /* noop */ }
           }
@@ -915,11 +1220,11 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
         if (!sidebar || typeof sidebar.registerTab !== "function") return undefined;
         try {
           return sidebar.registerTab({
-            id: "dsh-remote-gui",
-            title: function () { return "远程 GUI"; },
+            id: PANEL_ID,
+            title: function () { return "远端会话"; },
             order: 91,
             single: true,
-            component: function () { return h(RemoteGuiPanel); }
+            component: function () { return h(RemoteSessionsPanel, { closePanel: closePanel }); }
           });
         } catch (error) {
           fail("registerTab", error);
@@ -932,5 +1237,13 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
   }
 
   module.exports = { apply: apply, inject: inject };
+  /**
+   * 仅供离线自检 / 单元测试使用（不参与宿主加载）：
+   * 面板组件本身、以及纯函数（消息流构建 / 合并 / 序号工具）。
+   */
+  module.exports.__RemoteSessionsPanelForTest = RemoteSessionsPanel;
+  module.exports.__buildItemsForTest = buildItems;
+  module.exports.__mergeBySeqForTest = mergeBySeq;
+  module.exports.__textBlocksForTest = textBlocks;
   return module.exports;
 }});

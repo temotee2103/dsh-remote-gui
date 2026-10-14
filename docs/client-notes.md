@@ -71,16 +71,25 @@
 
 面板顶部有「目标」选择器：`本地实例` + 每台已注册远端主机各一个 chip，右侧角标写清当前是哪一个
 （`当前：本地实例` / `当前：远端 · <名字>`），会话区标题也随之写 `本地会话` / `远端会话`。
-选择持久化在 `localStorage["dsh-remote-gui.target"]`，**默认 `local`**（本地不需要隧道/SSH，
-最不容易出错；上次选过的目标会恢复）。
+选择持久化在 `localStorage["dsh-remote-gui.target"]`。**默认目标：有远端主机就选第一台远端**
+（2026-10-14 改；用户选过一次之后永远以那次为准，只有一台主机都没有时才落到「本地实例」）。
+为什么改：默认本地会让下面的 iframe 用 `location.origin` 把**本实例嵌进本实例**，
+用户看到的是「HARNESS / Loading plugins…」套娃，误以为面板卡死。
 
 | | 本地实例 | 远端主机 |
 |---|---|---|
 | 会话来源 | `POST /api/session/list`（**相对路径**，`credentials: "same-origin"`） | `GET /api/dsh-remote-gui/sessions?id=`（宿主的隧道通道） |
 | 信封 | `{type:"client-request", rpcId, method:"session/list", payload:{args:{_request:{}}}}` | 由宿主按同一信封代取 |
 | 数据 | `result.value.items`，用 `mapSessionItem()` 映射 | 宿主已映射好的 `Session[]` |
-| iframe src | **`location.origin`**（client.js **L562**） | `host.seedUrl` → `/seed` 现取 → `http://127.0.0.1:<隧道端口>/` |
+| iframe src | **无**（2026-10-14 起不再嵌 `location.origin`；改显示提示文案） | `host.seedUrl` → `/seed` 现取 → `http://127.0.0.1:<隧道端口>/` |
 | 归档按钮 | **不显示**（归档走宿主远端路由，本地分支不碰它） | 显示 |
+
+> ⚠️ **归档的信封 key**（2026-10-14 修）：宿主 `workspace/archiveSession` 的形参名是 **`request`**，
+> 不是 `session/list` 那样的 `_request`。插件原来的 `remoteRpc` 把 key 写死成 `_request`，
+> 于是归档请求被远端判为 `gateway/arguments-invalid`
+> （`missing "request"; unexpected "_request"`），**归档从未生效过**，界面上只表现为"点了没反应"。
+> 现在 key 由 `lib/remote.js` 的 `ARGS_KEY_BY_METHOD` 按方法名决定，归档调用点再显式传
+> `argsKey:'request'`；详情与全量核对结论见 `docs/SPEC.md` 的「远端契约」一节。
 
 「本地实例」与「远端」共用同一套行渲染与同一个会话形状 —— `mapSessionItem()` 的字段与宿主半边
 `lib/index.js` L431-439 的映射逐字一致（`sessionId` / `projections.values.title` / `running` /
