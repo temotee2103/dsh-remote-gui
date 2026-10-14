@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-gui",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Embed a remote DeepSeek Harness GUI in the local DSH window over an SSH tunnel, list the remote sessions, and switch between the local instance and any remote host. Standalone implementation using the DSH 0.2.x credential-cookie and typert RPC contract.",
   "license": "MIT",
   "type": "module",
@@ -22,6 +22,7 @@
     "lib/**/*.js",
     "client.js",
     "cordis.patch.yml",
+    "assets/**/*.png",
     "screenshots.json",
     "README.md",
     "CHANGELOG.md",

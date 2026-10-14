@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-10-14
+
+### Fixed
+
+- **The panel never rendered.** `client.js` read a `loading` variable that was never
+  declared, so `RemoteGuiPanel` threw `ReferenceError: loading is not defined` while
+  evaluating the dependency array of a `useEffect` — on every render, for every target,
+  leaving the overlay with a title bar and an empty body. Found by loading the plugin in a
+  throwaway profile and actually opening the panel; the test suite calls `apply()` but never
+  renders the component, so it could not catch this.
+- `screenshots.json` lists raw.githubusercontent URLs instead of `{path, caption}` objects:
+  dsh-market's renderer only accepts strings and silently drops anything else.
+
+### Added
+
+- Screenshots of the footer entry, the panel, and the panel pointed at a remote host.
+
 ## [0.1.1] - 2026-10-14
 
 Packaging and documentation only -- no behaviour change beyond one retry.

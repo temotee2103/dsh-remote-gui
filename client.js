@@ -228,6 +228,7 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     var setHosts = hostsState[1];
 
     var loadingState = useState(true);
+    var loading = loadingState[0];
     var setLoading = loadingState[1];
 
     var errorState = useState(null);
