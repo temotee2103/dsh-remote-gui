@@ -18,10 +18,9 @@ jobs:
       # The plugin has no runtime dependencies (official @deepseek-ai/* packages are
       # peer dependencies provided by the harness), so no install step is needed —
       # the test suite uses node:test and a local mock remote.
-      - name: Parse check (host half + browser half)
+      - name: Parse check (every host-half module + the browser half)
         run: |
-          node --check lib/index.js
-          node --check client.js
+          for f in lib/*.js client.js; do node --check "$f"; done
 
       - name: package.json is valid and declares the bundle manifest
         run: |
