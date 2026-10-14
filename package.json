@@ -5,6 +5,9 @@
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node --test test/"
+  },
   "exports": {
     ".": {
       "default": "./lib/index.js"
@@ -21,7 +24,8 @@
     "cordis.patch.yml",
     "screenshots.json",
     "README.md",
-    "SPEC.md",
+    "CHANGELOG.md",
+    "docs/SPEC.md",
     "LICENSE"
   ],
   "keywords": [
