@@ -1,6 +1,11 @@
 # 官方 Discussions 发帖草稿（照 [Plugin Category Guidelines #2004] 的模板）
 
-**目标分类**：`🙌 Show Your Plugins!`（https://github.com/deepseek-ai/deepseek-harness/discussions/categories/show-your-plugins）
+**目标分类**：`🙌 Show Your Plugins!`
+- 分类页：https://github.com/deepseek-ai/deepseek-harness/discussions/categories/show-your-plugins
+- **categoryId（createDiscussion 必填，2026-10-14 用 GraphQL 只读查询取得）**：`DIC_kwDOT3T1g84DDSUe`
+- 该仓库的 6 个分类：Announcements / General / Ideas / Polls / Q&A / Show Your Plugins!
+- 发帖权限：当前 gh token 的 scope 是 `gist, read:org, repo`，**不含 `write:discussion`** →
+  发帖前需 `gh auth refresh -s write:discussion`（浏览器授权一次），或把正文手动贴过去。
 
 **官方硬性要求**（来自置顶帖 #2004，逐条对照）：
 - 标题格式固定：`DSH | 项目名称 | 一句话说明用途`
