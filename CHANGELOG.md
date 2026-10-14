@@ -31,9 +31,9 @@ First release.
 - **Agent tool `remote_gui_run_task`** — runs a one-shot task on a remote host over
   `ssh + dsh --profile headless` and returns its result, with `output.render` returning a
   ContentBlock array as the 0.2.x tool contract requires.
-- **Eight loopback-only routes** under `/api/dsh-remote-gui/` (hosts, host, tunnel, health,
-  sessions, session-archive, seed, proxy), plus the host registry at
-  `$DSH_HOME/remote-gui-hosts.json`.
+- **Eight distinct loopback-only routes** under `/api/dsh-remote-gui/` (hosts, host, tunnel,
+  health, sessions, session-archive, seed, proxy) — nine table rows, since `/hosts` serves both
+  GET and POST — plus the host registry at `$DSH_HOME/remote-gui-hosts.json`.
 - **Implements the DSH 0.2.x credential and typert RPC contract** — the authority-bound
   browser cookie, the `/api/<ns>/<method>` path with the `payload.args._request` envelope,
   and data read from `result.value`.

@@ -10,7 +10,7 @@
  * 取 `module.exports = { apply, inject }`。`apply(ctx)` 里用 `ctx.effect(fn, label)`
  * 挂载带清理函数的副作用。
  *
- * ── 契约（与 SPEC.md 逐条对齐；不要改这里的路径）─────────────────────────────
+ * ── 契约（与 docs/SPEC.md 逐条对齐；不要改这里的路径）─────────────────────────
  *   GET    /api/dsh-remote-gui/hosts            → { hosts: Host[] }
  *   POST   /api/dsh-remote-gui/hosts            ← { alias, name?, port?, localPort?, autoTunnel? }
  *                                               → { host: Host }
