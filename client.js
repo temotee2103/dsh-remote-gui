@@ -53,13 +53,18 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
   var useRef = React.useRef;
 
   /**
-   * 宿主声明的依赖面：插槽 / 连接 / 语言。
-   * ⚠️ 不要在这里加 betterSidebar —— 本机整套插件与 harness 本体都没有提供这个服务
-   * （实测：app.asar 里 0 次命中，已装插件里无人注册）。cordis 的 inject 是**必需**
-   * 依赖，列一个不存在的服务会让整个客户端半边永远不激活（面板根本不出现）。
-   * 代码里对 ctx.betterSidebar / ctx.layout 的用法都做了 typeof 守卫 + try/catch。
+   * 宿主声明的依赖面：插槽 / 布局 / 连接 / 语言。
+   * ⚠️ **用到哪个服务就必须在这里声明**：cordis 的服务代理在未声明时抛
+   * `cannot get property "layout" without inject`（2026-10-14 实测踩到：
+   * 面板能开但关闭按钮/Esc 全部静默失效，因为 closePanel 里的 ctx.layout 抛错被 catch 吞了）。
+   * ⚠️ 但也**不要**在这里加不存在的服务 —— inject 是**必需**依赖，列一个永不出现的服务
+   * （如 betterSidebar：本机整套已装插件与 harness 本体里 0 次命中）会让整个客户端半边
+   * 永远不激活，面板根本不出现（这也是 dsh-sev 在本机不可用的原因之一）。
+   * `layout` 由 ui-layout 提供，而 `sidebar.panellist` / `main` 这两个座位本来就由
+   * ui-layout + ui-sidebar 声明 —— 没有它们的组合里，本插件本来也无处可挂。
+   * 代码里对 ctx.betterSidebar 的用法仍保留 typeof 守卫 + try/catch 的可选增强。
    */
-  var inject = ["slots", "connection", "locale"];
+  var inject = ["slots", "layout", "connection", "locale"];
 
   /** 侧栏行 id 与中心列 key 必须**是同一个字符串**（sidebar.panellist 的 id 寻址 main 的 key）。 */
   var PANEL_ID = "dsh-remote-gui";
@@ -205,6 +210,32 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     }
   }
 
+  /** 带 HTTP 状态码的 GET（用来区分"路由还没加载"和"远端出错"）。 */
+  function getJsonEx(url) {
+    return fetch(url).then(function (r) {
+      return r.json().catch(function () { return null; }).then(function (body) {
+        return { status: r.status, body: body };
+      });
+    });
+  }
+
+  /**
+   * 把一次插件路由调用的失败翻译成给人看的话。
+   *
+   * 为什么要专门认 401/404：本插件的 `/api/dsh-remote-gui/*` 是宿主"精确路由"，
+   * 已注册的路由**不走浏览器鉴权**（实测：/hosts 无 cookie 也 200），
+   * 而未注册的路径会掉进连接层 → **401**（不是 404）。
+   * 所以"客户端半边已经热加载、宿主半边还是旧代码"这个很常见的情况，
+   * 表现就是 401/404，而不是任何有意义的业务错误 —— 必须直说是要重启应用。
+   */
+  function describeRouteFailure(status, fallback) {
+    if (status === 401 || status === 404) {
+      return "本插件的会话路由还没就绪（HTTP " + status + "）—— 客户端半边已热加载、"
+        + "宿主半边还是旧代码。请重启 DSH 应用（或重启 dsh web）后重试。";
+    }
+    return fallback + (status ? "（HTTP " + status + "）" : "");
+  }
+
   // ── 消息流：把远端 session/page 的 records 变成可读条目 ─────────────────────
   //
   // 事件形状（2026-10-14 从真远端 session/page 的响应里读出来的，逐条实测）：
@@ -323,6 +354,33 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     return out;
   }
 
+  /**
+   * 本机记住"我归档过哪些远端会话"。
+   *
+   * 为什么需要它（2026-10-14 实测）：远端 `session/list` 返回的条目里**根本没有归档字段**
+   * （keys 只有 sessionId/updatedAt/agentAvailable/running/blank/cwd/projections；归档过的会话
+   * 与没归档的形状完全一样）。真正的归档状态在 `workspace/*` 那条**流式**通道里
+   * （`workspace/follow` 是 mode:'stream'，要开 WebSocket）。
+   * 所以：归档 RPC 是真调了、远端也真归档了，但列表里那一行会照旧出现 ——
+   * 看起来就像"点了没反应"。这里用一份**本机视图过滤**把这个差别补上，
+   * 并在界面上如实写明"本机记录"，不假装是远端权威状态。
+   */
+  var ARCHIVED_KEY = "dsh-remote-gui.archived";
+
+  function readArchivedMap() {
+    try {
+      var raw = window.localStorage.getItem(ARCHIVED_KEY);
+      var parsed = raw ? JSON.parse(raw) : null;
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function writeArchivedMap(map) {
+    try { window.localStorage.setItem(ARCHIVED_KEY, JSON.stringify(map)); } catch (e) { /* 忽略 */ }
+  }
+
   // ── 主面板（中心列；同 key 才被切到）────────────────────────────────────────
 
   /**
@@ -375,6 +433,28 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     var steerState = useState(false);
     var steer = steerState[0];
     var setSteer = steerState[1];
+
+    /** 会话列表过滤词（远端常有几百条会话，没有过滤就只能靠眼睛找）。 */
+    var filterState = useState("");
+    var filter = filterState[0];
+    var setFilter = filterState[1];
+
+    /**
+     * 鼠标悬停/选中的会话行 —— 行内动作（归档）只在这一行显示。
+     * 与宿主自己的侧栏会话行同一约定（`sidebar.workspaces.session.row.action` 也是悬停才出现）：
+     * 几百条会话各挂一个常驻按钮，无障碍树里就是几百个同名动作，谁也挑不出是哪一条。
+     */
+    var hoverState = useState(null);
+    var hoverId = hoverState[0];
+    var setHoverId = hoverState[1];
+
+    /** 本机记录的"我归档过"的集合（见 readArchivedMap 的说明）＋ 是否显示它们。 */
+    var archivedState = useState(readArchivedMap);
+    var archivedMap = archivedState[0];
+    var setArchivedMap = archivedState[1];
+    var showArchivedState = useState(false);
+    var showArchived = showArchivedState[0];
+    var setShowArchived = showArchivedState[1];
 
     var mountedRef = useRef(true);
     useEffect(function () {
@@ -485,12 +565,13 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
       if (!sessionId || !activeHostKey || !tunnelRunning) return undefined;
       var cancelled = false;
       var loadPage = function (asOf) {
-        return getJson(qs(API.page, {
+        return getJsonEx(qs(API.page, {
           id: activeHostKey,
           sessionId: sessionId,
           throughSeq: asOf,
           maxMessages: PAGE_MAX_MESSAGES
-        })).then(function (p) {
+        })).then(function (res) {
+          var p = res.body;
           if (cancelled || !mountedRef.current) return;
           if (p && Array.isArray(p.records)) {
             setOpen(function (prev) {
@@ -507,20 +588,27 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
           } else {
             setOpen(function (prev) {
               if (!prev || prev.sessionId !== sessionId) return prev;
-              return Object.assign({}, prev, { loading: false, error: errText(p, "读取远端会话正文失败") });
+              return Object.assign({}, prev, {
+                loading: false,
+                error: describeRouteFailure(res.status, errText(p, "读取远端会话正文失败"))
+              });
             });
           }
         });
       };
       var tick = function () {
-        return getJson(qs(API.projection, { id: activeHostKey, sessionId: sessionId })).then(function (d) {
+        return getJsonEx(qs(API.projection, { id: activeHostKey, sessionId: sessionId })).then(function (res) {
+          var d = res.body;
           if (cancelled || !mountedRef.current) return;
           var proj = d && d.projection;
           var asOf = proj && typeof proj.asOfSeq === "number" ? proj.asOfSeq : null;
           if (asOf === null) {
             setOpen(function (prev) {
               if (!prev || prev.sessionId !== sessionId || prev.records.length) return prev;
-              return Object.assign({}, prev, { loading: false, error: errText(d, "读取远端会话投影失败") });
+              return Object.assign({}, prev, {
+                loading: false,
+                error: describeRouteFailure(res.status, errText(d, "读取远端会话投影失败"))
+              });
             });
             return;
           }
@@ -628,10 +716,33 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
       });
     }
 
+    /**
+     * 两步确认（面板内，不用 window.confirm）。
+     * 为什么不用 window.confirm：它是**模态原生对话框**，会阻塞页面（实测：自动化点击
+     * 卡在 dialog 上 30 秒超时），而且样式不受主题控制。
+     * 这里的语义完全一样：第一次点只是"武装"，第二次点才真做；点别处或 5 秒不动就自动解除。
+     */
+    var pendingState = useState(null);   // 待确认的动作 key
+    var pending = pendingState[0];
+    var setPending = pendingState[1];
+    var pendingTimerRef = useRef(null);
+
+    /** 第一次调用只是武装（返回 false），第二次同 key 调用才放行（返回 true）。 */
+    function armThenRun(key) {
+      if (pending === key) {
+        if (pendingTimerRef.current) { window.clearTimeout(pendingTimerRef.current); pendingTimerRef.current = null; }
+        setPending(null);
+        return true;
+      }
+      setPending(key);
+      if (pendingTimerRef.current) window.clearTimeout(pendingTimerRef.current);
+      pendingTimerRef.current = window.setTimeout(function () { setPending(null); pendingTimerRef.current = null; }, 5000);
+      return false;
+    }
+
     function removeHost(host) {
-      var label = host.name || host.alias;
-      if (!window.confirm("删除远程主机「" + label + "」？\n（隧道会断开；主机记录从注册表移除）")) return;
       var id = hostId(host);
+      if (!armThenRun("remove:" + id)) return;
       void withBusy("remove:" + id, function () {
         return sendJson(qs(API.host, { id: id }), "DELETE").then(function (d) {
           if (!mountedRef.current) return;
@@ -644,11 +755,22 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
 
     function archiveSession(host, session) {
       var id = hostId(host);
-      if (!window.confirm("归档远端会话「" + sessionTitle(session) + "」？")) return;
+      if (!armThenRun("archive:" + session.sessionId)) return;
       void withBusy("archive:" + session.sessionId, function () {
         return sendJson(API.archive, "POST", { id: id, sessionId: session.sessionId }).then(function (d) {
           if (!mountedRef.current) return;
           if (d && d.ok) {
+            // 远端已归档；但 session/list 不带归档标记（见 readArchivedMap 说明），
+            // 所以同时记进本机过滤表，否则下一轮刷新这一行又回来了。
+            setArchivedMap(function (prev) {
+              var next = {};
+              for (var k in prev) if (Object.prototype.hasOwnProperty.call(prev, k)) next[k] = prev[k];
+              var list = (next[id] || []).slice();
+              if (list.indexOf(session.sessionId) < 0) list.push(session.sessionId);
+              next[id] = list;
+              writeArchivedMap(next);
+              return next;
+            });
             setSessions(function (prev) {
               return (prev || []).filter(function (s) { return s.sessionId !== session.sessionId; });
             });
@@ -667,10 +789,12 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
         return sendJson(API.create, "POST", { id: activeHostKey, cwd: cwd }).then(function (d) {
           if (!mountedRef.current) return;
           if (d && d.ok && d.sessionId) {
-            setSendMsg({ kind: "info", text: "已新建远端会话 " + String(d.sessionId).slice(0, 20) + "…" });
+            // openSession 会清空 sendMsg（新会话=干净状态），所以这条提示必须在它之后再写，
+            // 否则用户看不到"新建成功"这一句（第一版就是这个顺序，提示一闪即没）。
             return refreshSessions().then(function () {
               if (!mountedRef.current) return;
               openSession({ sessionId: d.sessionId, title: null, cwd: cwd || null });
+              setSendMsg({ kind: "ok", text: "已在远端新建会话：" + d.sessionId + "（尚未花任何额度；发第一条消息才会跑模型）" });
             });
           }
           setError(errText(d, "新建远端会话失败"));
@@ -680,15 +804,15 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
 
     /**
      * 真发送。⚠️ 这一步会让**远端**真的跑一轮模型并消耗额度，
-     * 所以：① 必须先过 window.confirm；② 只有用户显式点「发送」或按 Ctrl/Cmd+Enter 才会走到这里；
+     * 所以：① 必须再点一次「确认发送」（两步确认，见 armThenRun）；
+     * ② 只有用户显式点「发送」或按 Ctrl/Cmd+Enter 才会走到这里；
      * ③ 没有任何自动重试/自动补发。发送后立刻拉一次正文，之后交给轮询。
      */
     function sendPrompt() {
       var sessionId = open && open.sessionId;
       var text = draft;
       if (!sessionId || !activeHostKey || !text.trim()) return;
-      if (!window.confirm("发送到远端会话「" + (open.title || String(sessionId).slice(0, 12)) + "」？\n\n"
-        + "⚠️ 这会让远端真的执行一轮模型调用并消耗额度。")) return;
+      if (!armThenRun("send:" + sessionId)) return;
       setBusy("send");
       setSendMsg({ kind: "info", text: "已发送，等待远端受理…" });
       sendJson(API.prompt, "POST", {
@@ -760,13 +884,20 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
         });
     }
 
-    // Esc 关闭：只在焦点不在输入控件里时生效（免得打字打到一半被关掉）
+    /**
+     * Esc 关闭面板。
+     * 只在一处例外：焦点在**草稿输入框**里（正在打字）—— 那种情况先让它失焦，别把已输入的草稿连面板一起关掉。
+     * 其余任何位置（包括过滤框、按钮、列表某一行）都关。
+     * （第一版写成"焦点在 input 里就不关"，结果在过滤框里按 Esc 完全没反应 —— 那是缺陷不是保护。）
+     */
+    var draftRef = useRef(null);
     useEffect(function () {
       var onKey = function (e) {
         if (e.key !== "Escape" && e.key !== "Esc") return;
-        var t = e.target;
-        var tag = t && t.tagName ? String(t.tagName).toLowerCase() : "";
-        if (tag === "textarea" || tag === "input") return;
+        if (draftRef.current && e.target === draftRef.current) {
+          try { draftRef.current.blur(); } catch (err) { /* noop */ }
+          return;
+        }
         if (typeof closePanel === "function") closePanel();
       };
       document.addEventListener("keydown", onKey, true);
@@ -778,6 +909,17 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     //   面板长在宿主的 React 树里，所以**前景色一律 inherit**，层次用 opacity 表达；
     //   只有强调色（accent / 错误红 / 状态点）写死，并且背景与前景成对出现，
     //   不出现"背景靠主题变量、前景写死白"的组合 —— 那种组合在浅色主题下会隐形。
+    // 危险色（归档 / 错误文字）用宿主自己的语义 token，不写死红：
+    // 实测对底色的对比度 —— dark rgb(242,90,90) 5.55:1；light rgb(236,19,19) 4.50:1。
+    // 写死的 #e07171 是 dark 4.49:1 / light 2.79:1（浅色主题下"归档"和错误文字几乎看不清）。
+    var dangerColor = "var(--dsw-alias-state-error-primary, #e07171)";
+    /**
+     * 行内动作（"归档"按钮）只出现在**悬停或选中**的行上，所以它永远压在行的底色上，
+     * 而不是应用底色：纯 token 在那种底色上只有 dark 4.24:1 / light 4.04:1（低于 AA 的 4.5）。
+     * 往正文字色方向混 30% 就能同时满足两个主题，而且仍然是主题 token（不是写死两套值）：
+     * 实测 dark 5.88:1 / light 6.74:1。`color-mix` 不被支持时该声明无效 → 回退到继承色（17:1）。
+     */
+    var dangerOnRow = "color-mix(in srgb, " + dangerColor + " 70%, var(--dsw-alias-label-primary, currentColor))";
     var sep = "var(--dsw-alias-separator-primary, rgba(128,128,128,.22))";
     var softBg = "var(--dsw-specific-sidebar-nav-item-hover, var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.12)))";
     var accent = "var(--dsw-alias-brand-primary, var(--dsh-accent, #4a7dff))";
@@ -816,14 +958,14 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
       },
       dangerBtn: {
         padding: "4px 8px", borderRadius: 6, border: "1px solid " + sep,
-        background: "transparent", color: "#e07171", cursor: "pointer", font: "inherit", fontSize: 12, flexShrink: 0
+        background: "transparent", color: dangerOnRow, cursor: "pointer", font: "inherit", fontSize: 12, flexShrink: 0
       },
       chip: {
         padding: "4px 10px", borderRadius: 999, border: "1px solid " + sep,
         background: "transparent", color: "inherit", cursor: "pointer", font: "inherit", fontSize: 12,
         flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 5
       },
-      err: { color: "#e07171", fontSize: 12, padding: "8px 14px 0", flexShrink: 0 },
+      err: { color: dangerColor, fontSize: 12, padding: "8px 14px 0", flexShrink: 0 },
       body: { flex: 1, minHeight: 0, display: "flex" },
       listCol: {
         width: 260, flexShrink: 0, display: "flex", flexDirection: "column", minHeight: 0,
@@ -874,6 +1016,19 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
 
     var items = buildItems(open ? open.records : []);
 
+    /** 过滤后的会话列表（先按本机归档表隐藏，再按过滤词匹配；大小写不敏感）。 */
+    var archivedHere = (activeHostKey && archivedMap[activeHostKey]) || [];
+    var shownSessions = sessions || [];
+    if (archivedHere.length && !showArchived) {
+      shownSessions = shownSessions.filter(function (s) { return archivedHere.indexOf(s.sessionId) < 0; });
+    }
+    if (filter.trim()) {
+      var needle = filter.trim().toLowerCase();
+      shownSessions = shownSessions.filter(function (s) {
+        return (sessionTitle(s) + " " + (s.cwd || "") + " " + s.sessionId).toLowerCase().indexOf(needle) >= 0;
+      });
+    }
+
     function renderTranscript() {
       if (!open) {
         return h("div", { style: styles.notice },
@@ -919,11 +1074,11 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
               h("div", { style: styles.toolHead },
                 h("span", null, "🔧 " + it.name),
                 h("span", { style: styles.sessionMeta }, clockTime(it.time)),
-                it.isError ? h("span", { style: { color: "#e07171", fontSize: 11 } }, "失败") : null
+                it.isError ? h("span", { style: { color: dangerColor, fontSize: 11 } }, "失败") : null
               ),
               it.args ? h("div", { style: styles.mono }, clip(it.args, 1200)) : null,
               it.result !== null && it.result !== undefined
-                ? h("div", { style: Object.assign({}, styles.toolResult, it.isError ? { color: "#e07171" } : null) },
+                ? h("div", { style: Object.assign({}, styles.toolResult, it.isError ? { color: dangerColor } : null) },
                     h("div", { style: styles.roleLabel }, "结果"),
                     h("div", { style: styles.mono }, clip(it.result, 2000)))
                 : h("div", { style: styles.roleLabel }, "（本轮没有可见结果）")
@@ -932,6 +1087,8 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
         ),
         h("div", { style: styles.composer },
           h("textarea", {
+            ref: draftRef,
+            "data-dsh-remote-draft": "",
             style: styles.textarea,
             placeholder: "在这里输入，然后点「发送」（或 Ctrl/Cmd+Enter）。发送会让远端真的跑一轮模型、消耗额度。",
             value: draft,
@@ -944,12 +1101,22 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
           h("div", { style: styles.composerRow },
             h("button", {
               type: "button",
-              style: (!draft.trim() || busy === "send") ? styles.btnOff : styles.btnPrimary,
+              "data-dsh-remote-send": "",
+              // 两步确认的第二态：第一次点变成"确认发送（会花钱）"，再点才真的发
+              style: (!draft.trim() || busy === "send") ? styles.btnOff : (pending === "send:" + (open && open.sessionId) ? styles.btnPrimary : styles.btnPrimary),
               disabled: !draft.trim() || busy === "send",
               onClick: sendPrompt
-            }, busy === "send" ? "发送中…" : "发送到远端"),
+            }, busy === "send"
+              ? "发送中…"
+              : (pending === "send:" + (open && open.sessionId) ? "确认发送（会花钱）" : "发送到远端")),
             h("label", { style: Object.assign({}, styles.sub, { display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }) },
-              h("input", { type: "checkbox", checked: steer, onChange: function (e) { setSteer(!!e.target.checked); } }),
+              h("input", {
+                type: "checkbox",
+                checked: steer,
+                // 包在 label 里并不保证无障碍名（实测快照里这个 checkbox 是匿名的），显式给一个
+                "aria-label": "插话（steer）：远端正在跑时用它插入当前步骤",
+                onChange: function (e) { setSteer(!!e.target.checked); }
+              }),
               "插话 (steer)"
             ),
             h("button", {
@@ -961,7 +1128,7 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
             }, busy === "probe" ? "探针中…" : "RPC 探针（0 费用）")
           ),
           sendMsg ? h("div", {
-            style: Object.assign({}, styles.infoLine, sendMsg.kind === "err" ? { color: "#e07171" } : null)
+            style: Object.assign({}, styles.infoLine, sendMsg.kind === "err" ? { color: dangerColor } : null)
           }, sendMsg.text) : null
         )
       );
@@ -1034,7 +1201,7 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
           style: styles.dangerBtn,
           disabled: busy === "remove:" + activeHostKey,
           onClick: function () { removeHost(activeHost); }
-        }, "删除主机") : null
+        }, (pending === "remove:" + activeHostKey) ? "确认删除主机" : "删除主机") : null
       ),
 
       error ? h("div", { style: styles.err }, error) : null,
@@ -1043,7 +1210,19 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
       h("div", { style: styles.body },
         h("div", { style: styles.listCol },
           h("div", { style: styles.listHead },
-            h("span", { style: styles.sub }, "远端会话 · " + (sessions ? sessions.length : 0) + " 条"),
+            h("span", { style: styles.sub }, "远端会话 · " + shownSessions.length + (filter.trim() ? "/" + sessions.length : "") + " 条"),
+            archivedHere.length ? h("label", {
+              style: Object.assign({}, styles.sub, { display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }),
+              title: "远端 session/list 不返回归档标记，这份隐藏名单记在本机浏览器里"
+            },
+              h("input", {
+                type: "checkbox",
+                checked: showArchived,
+                "aria-label": "显示已归档的会话（本机记录，共 " + archivedHere.length + " 条）",
+                onChange: function (e) { setShowArchived(!!e.target.checked); }
+              }),
+              "显示已归档 " + archivedHere.length
+            ) : null,
             h("button", {
               type: "button",
               style: styles.btn,
@@ -1052,28 +1231,61 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
               onClick: createSession
             }, busy === "create" ? "新建中…" : "＋ 新建")
           ),
+          h("div", { style: { padding: "0 8px 6px", flexShrink: 0 } },
+            h("input", {
+              type: "search",
+              "data-dsh-remote-filter": "",
+              "aria-label": "过滤远端会话（标题 / 路径 / 会话 id）",
+              placeholder: "过滤：标题 / 路径 / 会话 id",
+              value: filter,
+              spellCheck: false,
+              onChange: function (e) { setFilter(e.target.value); },
+              style: Object.assign({}, styles.input, { flex: "1 1 auto", width: "100%", fontSize: 12, padding: "5px 8px" })
+            })
+          ),
           h("div", { style: styles.listBox },
             !activeHost ? h("div", { style: styles.empty }, "先添加并连接一台远端主机") : null,
             activeHost && !tunnelRunning ? h("div", { style: styles.empty }, "隧道未连接 —— 点上面的「连接隧道」") : null,
             tunnelRunning && sessions.length === 0 ? h("div", { style: styles.empty }, "没有读到远端会话（或远端还没有会话）") : null,
-            (sessions || []).map(function (s) {
+            tunnelRunning && sessions.length > 0 && shownSessions.length === 0
+              ? h("div", { style: styles.empty }, "没有匹配「" + filter.trim() + "」的会话") : null,
+            shownSessions.map(function (s) {
               var on = !!open && open.sessionId === s.sessionId;
+              var title = sessionTitle(s);
               return h("div", {
                 key: s.sessionId,
+                // 稳定的语义锚点（与 task-board / dsh-ssh 的 data-dsh-* 约定一致）：
+                // 让"这一行是哪条远端会话"可以只用 CSS/测试选择器定位，不靠文案。
+                "data-dsh-remote-session": s.sessionId,
+                "data-dsh-remote-session-selected": on ? "true" : undefined,
+                // 行本身是可点开的动作：给它 button 语义 + 键盘可达 + 唯一可访问名，
+                // 否则整张会话列表在无障碍树里完全是空的（只有一堆"归档"按钮漂着）。
+                role: "button",
+                tabIndex: 0,
+                "aria-pressed": on ? "true" : "false",
+                "aria-label": "打开远端会话：" + title + (s.cwd ? "（" + s.cwd + "）" : ""),
                 style: Object.assign({}, styles.sessionRow, on ? styles.sessionRowOn : null),
                 title: (s.cwd || "") + "\n" + s.sessionId,
-                onClick: function () { openSession(s); }
+                onClick: function () { openSession(s); },
+                onKeyDown: function (e) {
+                  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openSession(s); }
+                },
+                onMouseEnter: function () { setHoverId(s.sessionId); },
+                onMouseLeave: function () { setHoverId(function (prev) { return prev === s.sessionId ? null : prev; }); }
               },
                 h("span", { style: Object.assign({}, styles.dot, { background: s.running ? "#3ecf6a" : "#9a9a9a" }) }),
-                h("span", { style: styles.sessionTitle }, sessionTitle(s)),
+                h("span", { style: styles.sessionTitle }, title),
                 h("span", { style: styles.sessionMeta }, s.running ? "运行中" : relTime(s.updatedAt)),
-                h("button", {
+                // 归档按钮只在悬停或该行已选中时出现（见 hoverId 的说明）；键盘用户选中该行后同样能用
+                (on || hoverId === s.sessionId) ? h("button", {
                   type: "button",
-                  style: styles.dangerBtn,
+                  "data-dsh-remote-archive": s.sessionId,
+                  "aria-label": "归档会话：" + title,
                   title: "归档此会话（远端 workspace/archiveSession）",
+                  style: styles.dangerBtn,
                   disabled: busy === "archive:" + s.sessionId,
                   onClick: function (e) { e.stopPropagation(); archiveSession(activeHost, s); }
-                }, "归档")
+                }, (pending === "archive:" + s.sessionId) ? "确认归档" : "归档") : null
               );
             })
           )
@@ -1146,8 +1358,16 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
     /** 关闭 = 把主列切回会话页（宿主 ui-conversation 占的 key 就是 'conversation'）。 */
     function closePanel() {
       try {
+        // 诊断计数器：面板/宿主出问题时，"点没点到 closePanel"与"selectPanel 有没有生效"要能分开看
+        try {
+          var g = window;
+          g.__dshRemoteGuiCloseCalls = (g.__dshRemoteGuiCloseCalls || 0) + 1;
+        } catch (e) { /* noop */ }
         if (ctx.layout && typeof ctx.layout.selectPanel === "function") {
           ctx.layout.selectPanel(CONVERSATION_PANEL_ID);
+          try { window.__dshRemoteGuiLastSelect = CONVERSATION_PANEL_ID; } catch (e) { /* noop */ }
+        } else {
+          try { window.__dshRemoteGuiNoLayout = true; } catch (e) { /* noop */ }
         }
       } catch (error) {
         fail("layout.selectPanel(" + CONVERSATION_PANEL_ID + ")", error);
@@ -1245,5 +1465,6 @@ window.__ModuleLoader__.load({ id: "dsh-remote-gui", factory: (require) => {
   module.exports.__buildItemsForTest = buildItems;
   module.exports.__mergeBySeqForTest = mergeBySeq;
   module.exports.__textBlocksForTest = textBlocks;
+  module.exports.__describeRouteFailureForTest = describeRouteFailure;
   return module.exports;
 }});

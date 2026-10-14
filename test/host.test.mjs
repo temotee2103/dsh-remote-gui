@@ -312,7 +312,149 @@ test('RPC 信封：归档用的 key 是 `request`（不是 session/list 的 `_re
   }
 })
 
+// ── 原生会话视图用到的路由（读正文 / 发消息 / 新建会话）─────────────────────────
+// 这三个都是 2026-10-14 真机实测出来的契约，回归测试锁住形状：
+//   · 信封 key 必须是宿主形参名 `request`
+//   · session/page 的 throughSeq 必须是安全整数（超过 cursor 会被远端拒）
+//   · session/prompt 的正文必须非空白；只有显式 probe:true 才发空 content（零费用链路探针）
+
+test('GET /session-page：走 session/page，信封 key 是 request，records 原样透传', async () => {
+  const h = await makeHarness({ hostId: 'host-page' })
+  try {
+    const out = await call(h.routes, '/api/dsh-remote-gui/session-page', {
+      url: `/api/dsh-remote-gui/session-page?id=${h.host.id}&sessionId=s1&throughSeq=42&maxMessages=5`,
+    })
+    assert.equal(out.status, 200)
+    const body = JSON.parse(out.payload)
+    assert.equal(body.records.length, 1)
+    assert.equal(body.records[0].event.type, 'user/message')
+    assert.equal(body.hasMore, true)
+
+    const rpc = h.mock.state.rpcs[0]
+    assert.equal(rpc.path, '/api/session/page')
+    assert.equal(rpc.method, 'session/page')     // 斜杠形式
+    assert.deepEqual(Object.keys(rpc.args), ['request'], 'session/page 的形参名是 request')
+    assert.deepEqual(rpc.args.request.address, { kind: 'session', sessionId: 's1' })
+    assert.equal(rpc.args.request.throughSeq, 42)
+    assert.equal(rpc.args.request.maxMessages, 5)
+  } finally {
+    await h.close()
+  }
+})
+
+test('GET /session-page：throughSeq 缺失/非法 → 400，且**不打**远端 RPC', async () => {
+  const h = await makeHarness({ hostId: 'host-page-bad' })
+  try {
+    const missing = await call(h.routes, '/api/dsh-remote-gui/session-page', {
+      url: `/api/dsh-remote-gui/session-page?id=${h.host.id}&sessionId=s1`,
+    })
+    assert.equal(missing.status, 400)
+    const notInt = await call(h.routes, '/api/dsh-remote-gui/session-page', {
+      url: `/api/dsh-remote-gui/session-page?id=${h.host.id}&sessionId=s1&throughSeq=abc`,
+    })
+    assert.equal(notInt.status, 400)
+    assert.equal(h.mock.state.rpcs.length, 0, '参数不合法就不应该碰远端')
+  } finally {
+    await h.close()
+  }
+})
+
+test('GET /session-projection：走 session/projections（key=request），回投影原文', async () => {
+  const h = await makeHarness({ hostId: 'host-proj' })
+  try {
+    const out = await call(h.routes, '/api/dsh-remote-gui/session-projection', {
+      url: `/api/dsh-remote-gui/session-projection?id=${h.host.id}&sessionId=s1`,
+    })
+    assert.equal(out.status, 200)
+    assert.equal(JSON.parse(out.payload).projection.asOfSeq, 42)
+    const rpc = h.mock.state.rpcs[0]
+    assert.equal(rpc.method, 'session/projections')
+    assert.deepEqual(rpc.args, { request: { sessionId: 's1' } })
+  } finally {
+    await h.close()
+  }
+})
+
+test('POST /session-prompt：信封 key=request，正文进 content[0].text，mode 默认 queue', async () => {
+  const h = await makeHarness({ hostId: 'host-prompt' })
+  try {
+    const out = await call(h.routes, '/api/dsh-remote-gui/session-prompt', {
+      method: 'POST',
+      url: '/api/dsh-remote-gui/session-prompt',
+      payload: JSON.stringify({ id: h.host.id, sessionId: 's1', text: 'hello remote' }),
+    })
+    assert.equal(out.status, 200)
+    const rpc = h.mock.state.rpcs[0]
+    assert.equal(rpc.method, 'session/prompt')
+    assert.deepEqual(Object.keys(rpc.args), ['request'])
+    const req = rpc.args.request
+    assert.equal(req.sessionId, 's1')
+    assert.equal(req.mode, 'queue')
+    assert.deepEqual(req.content, [{ type: 'text', text: 'hello remote' }])
+    assert.equal(typeof req.requestId, 'string')
+  } finally {
+    await h.close()
+  }
+})
+
+test('POST /session-prompt：空白正文 → 400 且不打远端（花钱的动作必须有非空正文）', async () => {
+  const h = await makeHarness({ hostId: 'host-prompt-blank' })
+  try {
+    const blank = await call(h.routes, '/api/dsh-remote-gui/session-prompt', {
+      method: 'POST',
+      url: '/api/dsh-remote-gui/session-prompt',
+      payload: JSON.stringify({ id: h.host.id, sessionId: 's1', text: '   \n ' }),
+    })
+    assert.equal(blank.status, 400)
+    assert.match(blank.payload, /text required/)
+    assert.equal(h.mock.state.rpcs.length, 0)
+  } finally {
+    await h.close()
+  }
+})
+
+test('POST /session-prompt probe:true：发空 content 验证链路，远端拒绝被原样回显（零费用）', async () => {
+  const h = await makeHarness({ hostId: 'host-prompt-probe' })
+  try {
+    const out = await call(h.routes, '/api/dsh-remote-gui/session-prompt', {
+      method: 'POST',
+      url: '/api/dsh-remote-gui/session-prompt',
+      payload: JSON.stringify({ id: h.host.id, sessionId: 's1', probe: true }),
+    })
+    // 远端拒绝 → 插件路由把它变成 502 + error（界面据此显示"链路通 ✅ + 远端原话"）
+    assert.equal(out.status, 502)
+    const body = JSON.parse(out.payload)
+    assert.equal(body.error.code, 'gateway/bad-request')
+    assert.match(body.error.message, /non-whitespace text or an attachment/)
+    const rpc = h.mock.state.rpcs[0]
+    assert.deepEqual(rpc.args.request.content, [], 'probe 必须发空 content（远端在调模型前就拒）')
+  } finally {
+    await h.close()
+  }
+})
+
+test('POST /session-create：不传 sessionId 时 args 里就没有它，返回值带新会话 id', async () => {
+  const h = await makeHarness({ hostId: 'host-create' })
+  try {
+    const out = await call(h.routes, '/api/dsh-remote-gui/session-create', {
+      method: 'POST',
+      url: '/api/dsh-remote-gui/session-create',
+      payload: JSON.stringify({ id: h.host.id, cwd: '/tmp' }),
+    })
+    assert.equal(out.status, 200)
+    const body = JSON.parse(out.payload)
+    assert.equal(body.ok, true)
+    assert.equal(body.sessionId, 's-new')
+    const rpc = h.mock.state.rpcs[0]
+    assert.equal(rpc.method, 'session/create')
+    assert.deepEqual(rpc.args, { request: { cwd: '/tmp' } })
+  } finally {
+    await h.close()
+  }
+})
+
 test('凭据：RPC 请求必须带兑换来的 cookie', async () => {
+  const h = await makeHarness({ hostId: 'host-cookie' })
   try {
     const out = await call(h.routes, '/api/dsh-remote-gui/sessions', {
       url: `/api/dsh-remote-gui/sessions?id=${h.host.id}`,
