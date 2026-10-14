@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The plugin has no runtime dependencies (official @deepseek-ai/* packages are
+      # peer dependencies provided by the harness), so no install step is needed —
+      # the test suite uses node:test and a local mock remote.
+      - name: Parse check (host half + browser half)
+        run: |
+          node --check lib/index.js
+          node --check client.js
+
+      - name: package.json is valid and declares the bundle manifest
+        run: |
+          node -e "
+            const p = require('./package.json');
+            if (!p.dsh || !p.dsh.bundle || !p.dsh.bundle.patch) {
+              console.error('package.json is missing dsh.bundle.patch — dsh cannot install this plugin');
+              process.exit(1);
+            }
+            if (p.private) { console.error('package.json must not be private'); process.exit(1); }
+            console.log('ok: ' + p.name + '@' + p.version + '  bundle=' + p.dsh.bundle.patch);
+          "
+
+      - name: Tests
+        run: node --test test/
