@@ -6,6 +6,8 @@
 **Embed a remote DeepSeek Harness GUI in your local DSH window over an SSH tunnel,
 list the remote sessions, and switch between the local instance and any remote host.**
 
+> English version: [README.en.md](README.en.md)
+
 ---
 
 ## 这个插件解决什么
@@ -175,7 +177,7 @@ RPC        POST http://127.0.0.1:<隧道端口>/api/<ns>/<method>
 ## 验证记录
 
 宿主半边用**独立进程加载 + 真实隧道 + 真实远端**直接调用它的路由处理器
-（不依赖应用重启，见 `SPEC.md` 的复现方式）：
+（不依赖应用重启，见 [`docs/SPEC.md`](docs/SPEC.md) 的复现方式）：
 
 ```
 隧道      1 秒起好 state=running                                   ✓
