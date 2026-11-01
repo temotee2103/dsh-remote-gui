@@ -1,6 +1,6 @@
 # dsh-remote-gui
 
-**在本地 DSH 窗口里，直接操作远端那台 DSH。** 通过 SSH 隧道把远端 GUI 嵌进本地界面，
+**在本地 DSH 窗口里直接操作远端 DSH。** 通过 SSH 隧道把远端 GUI 嵌进本地界面，
 把远端会话列进面板，并在 **本地实例 ↔ 远端** 之间一键切换。
 
 **Embed a remote DeepSeek Harness GUI in your local DSH window over an SSH tunnel,
